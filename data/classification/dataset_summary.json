@@ -1,0 +1,70 @@
+{
+  "source_dataset_path": "C:\\Users\\ACER\\OneDrive\\Documents\\cargo-vision-cnn\\cargo-vision-cnn\\deployment_dataset",
+  "output_dataset_path": "C:\\Users\\ACER\\OneDrive\\Documents\\cargo-vision-cnn\\cargo-vision-cnn\\data\\classification",
+  "target_classes": {
+    "1": "box",
+    "2": "chair",
+    "3": "couch",
+    "4": "table",
+    "11": "suitcase",
+    "12": "table",
+    "20": "chair"
+  },
+  "padding_ratio": 0.08,
+  "splits": [
+    "train",
+    "valid",
+    "test"
+  ],
+  "source_images_per_split": {
+    "train": 202,
+    "valid": 25,
+    "test": 25
+  },
+  "source_labels_per_split": {
+    "train": 202,
+    "valid": 25,
+    "test": 25
+  },
+  "annotation_types": {
+    "polygon": 465,
+    "bbox": 8
+  },
+  "annotations_by_class": {
+    "box": 75,
+    "chair": 172,
+    "couch": 55,
+    "suitcase": 26,
+    "table": 145
+  },
+  "crops_per_class_per_split": {
+    "train": {
+      "box": 59,
+      "chair": 151,
+      "couch": 49,
+      "suitcase": 21,
+      "table": 111
+    },
+    "valid": {
+      "box": 9,
+      "chair": 13,
+      "couch": 4,
+      "suitcase": 4,
+      "table": 19
+    },
+    "test": {
+      "box": 7,
+      "chair": 8,
+      "couch": 2,
+      "suitcase": 1,
+      "table": 15
+    }
+  },
+  "rejected_annotations": 0,
+  "total_target_annotations": 473,
+  "total_crops_generated": 473,
+  "verified_valid_crops": 473,
+  "dry_run": false,
+  "expand_furniture": true,
+  "timestamp_utc": "2026-08-26T17:15:00Z"
+}

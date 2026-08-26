@@ -16,12 +16,19 @@ __pycache__/
 */.ipynb_checkpoints/*
 
 # Datasets (Do NOT commit raw or processed image data to Git)
+deployment_dataset/
 data/raw/
 data/processed/
+data/classification/train/
+data/classification/valid/
+data/classification/test/
 data/*.zip
 data/*.tar.gz
 data/*.csv
 !data/dataset_provenance.json
+!data/classification/dataset_summary.json
+!data/classification/README.md
+
 
 # Trained models and checkpoints
 models/*.keras
@@ -31,8 +38,11 @@ models/checkpoints/
 
 # Evaluation outputs and results (visualizations and logs)
 results/*.png
+results/*.jpg
+results/*.jpeg
 results/*.csv
 results/*.json
+results/data_inspection/
 !results/.gitkeep
 
 # IDE and OS specific
