@@ -1,0 +1,44 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# Datasets (Do NOT commit raw or processed image data to Git)
+data/raw/
+data/processed/
+data/*.zip
+data/*.tar.gz
+data/*.csv
+!data/dataset_provenance.json
+
+# Trained models and checkpoints
+models/*.keras
+models/*.h5
+models/*.weights.h5
+models/checkpoints/
+
+# Evaluation outputs and results (visualizations and logs)
+results/*.png
+results/*.csv
+results/*.json
+!results/.gitkeep
+
+# IDE and OS specific
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
