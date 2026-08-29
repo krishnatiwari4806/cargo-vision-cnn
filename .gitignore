@@ -17,8 +17,12 @@ __pycache__/
 
 # Datasets (Do NOT commit raw or processed image data to Git)
 deployment_dataset/
+deployment_dataset_expanded/
+deployment_dataset_expanded_temp/
 data/raw/
 data/processed/
+data/public_cache/
+data/openimages_supplemental/
 data/classification/train/
 data/classification/valid/
 data/classification/test/
@@ -28,21 +32,21 @@ data/*.csv
 !data/dataset_provenance.json
 !data/classification/dataset_summary.json
 !data/classification/README.md
-
+!data/dimension_benchmark/README.md
 
 # Trained models and checkpoints
 models/*.keras
 models/*.h5
 models/*.weights.h5
+models/*.pt
 models/checkpoints/
+*.pt
+
+# Training runs and outputs
+runs/
 
 # Evaluation outputs and results (visualizations and logs)
-results/*.png
-results/*.jpg
-results/*.jpeg
-results/*.csv
-results/*.json
-results/data_inspection/
+results/
 !results/.gitkeep
 
 # IDE and OS specific
