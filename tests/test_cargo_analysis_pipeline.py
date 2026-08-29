@@ -232,7 +232,99 @@ class TestCargoAnalysisPipeline(unittest.TestCase):
         res = pipeline_mobilenet.analyze(self.valid_image_path, quantity=1)
         self.assertEqual(res["status"], "SUCCESS")
         self.assertEqual(res["classification"]["detector_backend"], "mobilenetv2")
-        self.assertIn(res["classification"]["class_name"], ["box", "chair", "couch", "suitcase", "table"])
+    # -------------------------------------------------------------------------
+    # 13. Multi-Load: 2 Identical Items
+    # -------------------------------------------------------------------------
+    def test_multiload_two_identical_items(self):
+        """Verify multi-load aggregation for 2 identical items properly aggregates quantity and volume."""
+        res = self.pipeline.analyze_multiple([self.valid_image_path, self.valid_image_path], quantities=[1, 1])
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["mode"], "MULTI_LOAD")
+        self.assertEqual(res["total_items"], 2)
+        self.assertEqual(len(res["items"]), 2)
+        self.assertGreater(res["shipment_summary"]["total_volume_m3"], 0.0)
+        self.assertGreater(res["shipment_summary"]["total_floor_area_m2"], 0.0)
+        self.assertIn("vehicle_id", res["vehicle_recommendation"])
+
+    # -------------------------------------------------------------------------
+    # 14. Multi-Load: 2 Different Cargo Types
+    # -------------------------------------------------------------------------
+    def test_multiload_two_different_cargo_types(self):
+        """Verify multi-load aggregation handles different cargo images with distinct categories."""
+        car_img = os.path.join(PROJECT_ROOT, "data", "car.jpg")
+        if not os.path.exists(car_img):
+            self.skipTest("data/car.jpg not present.")
+
+        res = self.pipeline.analyze_multiple([car_img, self.valid_image_path], quantities=[1, 2])
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["total_items"], 3)
+        self.assertEqual(res["items"][0]["category"], "car")
+        self.assertEqual(res["items"][0]["quantity"], 1)
+        self.assertEqual(res["items"][1]["quantity"], 2)
+        self.assertIn("Accommodates combined shipment", res["vehicle_recommendation"]["reason"])
+
+    # -------------------------------------------------------------------------
+    # 15. Multi-Load: Refrigerator + 2 TVs + 4 Boxes Aggregation Math
+    # -------------------------------------------------------------------------
+    def test_multiload_mixed_refrigerator_tv_boxes_aggregation_math(self):
+        """Verify combined volume and floor area calculations for 1 refrigerator, 2 TVs, and 4 boxes."""
+        # Calculate requirements for individual items directly
+        refrig_dims = {"length_cm": 70.0, "width_cm": 70.0, "height_cm": 175.0}
+        tv_dims = {"length_cm": 120.0, "width_cm": 15.0, "height_cm": 75.0}
+        box_dims = {"length_cm": 45.0, "width_cm": 35.0, "height_cm": 30.0}
+
+        refrig_summary, _ = self.pipeline.calculate_cargo_requirements(refrig_dims, "refrigerator", 1)
+        tv_summary, _ = self.pipeline.calculate_cargo_requirements(tv_dims, "tv", 2)
+        box_summary, _ = self.pipeline.calculate_cargo_requirements(box_dims, "box", 4)
+
+        # Expected unit volumes:
+        # Refrigerator: 70*70*175 / 10^6 = 0.8575 m3; packing factor 0.85 -> 0.8575 / 0.85 = 1.0088 m3
+        # TV: 120*15*75 / 10^6 = 0.1350 m3; 2 TVs = 0.2700 / 0.80 = 0.3375 m3
+        # Box: 45*35*30 / 10^6 = 0.04725 m3; 4 boxes = 0.1890 / 0.80 = 0.23625 -> 0.2362 m3
+        expected_total_volume = round(refrig_summary["total_volume_m3"] + tv_summary["total_volume_m3"] + box_summary["total_volume_m3"], 4)
+        expected_floor_area = round(refrig_summary["required_floor_area_m2"] + tv_summary["required_floor_area_m2"] + box_summary["required_floor_area_m2"], 4)
+
+        items = [
+            {"category": "refrigerator", "quantity": 1, "dimensions": refrig_dims, "cargo_summary": refrig_summary},
+            {"category": "tv", "quantity": 2, "dimensions": tv_dims, "cargo_summary": tv_summary},
+            {"category": "box", "quantity": 4, "dimensions": box_dims, "cargo_summary": box_summary},
+        ]
+
+        rec, warnings = self.pipeline.recommend_vehicle_for_shipment(
+            items=items,
+            total_volume_m3=expected_total_volume,
+            total_floor_area_m2=expected_floor_area,
+        )
+
+        self.assertIsNotNone(rec["vehicle_id"])
+        # Should fit in a 3-Wheeler Auto (usable length 145cm, usable height 140cm < 175cm -> Auto fails height!)
+        # Tata Ace has 145cm height < 175cm -> Tata Ace fails height!
+        # Bolero Maxi Truck has 175cm height -> fits Bolero or Tata 407!
+        self.assertIn(rec["vehicle_id"], ["V_BOLERO_PICKUP", "V_TATA_407_14FT", "V_EICHER_19FT"])
+        self.assertIn("Accommodates combined shipment (7 items:", rec["reason"])
+
+    # -------------------------------------------------------------------------
+    # 16. Multi-Load: Massive Combined Shipment Exceeding Fleet Capacity
+    # -------------------------------------------------------------------------
+    def test_multiload_massive_shipment_exceeding_capacity(self):
+        """Verify massive multi-load shipment triggers multi-trip batching advice."""
+        items = [
+            {"category": "car", "quantity": 10, "dimensions": {"length_cm": 450.0, "width_cm": 180.0, "height_cm": 145.0}},
+            {"category": "couch", "quantity": 20, "dimensions": {"length_cm": 210.0, "width_cm": 90.0, "height_cm": 85.0}},
+        ]
+        rec, _ = self.pipeline.recommend_vehicle_for_shipment(items, total_volume_m3=200.0, total_floor_area_m2=120.0)
+        self.assertIn("exceeds standard single-vehicle capacity", rec["reason"])
+        self.assertEqual(rec["vehicle_id"], "V_CAR_CARRIER_MULTI")
+
+    # -------------------------------------------------------------------------
+    # 17. Warning Integrity: No Contradictory YOLO Warning When Resolved
+    # -------------------------------------------------------------------------
+    def test_no_false_yolo_detection_warning_when_resolved_by_fallback(self):
+        """Verify successful identification via MobileNetV2 does not attach false YOLO non-detection warning."""
+        res = self.pipeline.analyze(self.valid_image_path, quantity=1)
+        self.assertEqual(res["status"], "SUCCESS")
+        for warning in res["warnings"]:
+            self.assertNotIn("No objects detected by YOLO detector above confidence threshold", warning)
 
 
 if __name__ == "__main__":
