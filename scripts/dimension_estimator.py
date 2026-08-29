@@ -123,6 +123,38 @@ DEFAULT_CATEGORY_PRIORS: Dict[str, Dict[str, Any]] = {
         "default_weight_kg": 1400.0,
         "confidence": 0.75,
     },
+    "refrigerator": {
+        "length_cm": 70.0,
+        "width_cm": 70.0,
+        "height_cm": 175.0,
+        "description": "Standard domestic single/double door refrigerator",
+        "default_weight_kg": 75.0,
+        "confidence": 0.70,
+    },
+    "tv": {
+        "length_cm": 120.0,
+        "width_cm": 15.0,
+        "height_cm": 75.0,
+        "description": "Standard 50-inch flat panel television",
+        "default_weight_kg": 15.0,
+        "confidence": 0.70,
+    },
+    "bed": {
+        "length_cm": 200.0,
+        "width_cm": 160.0,
+        "height_cm": 60.0,
+        "description": "Standard double / queen bed frame and mattress",
+        "default_weight_kg": 50.0,
+        "confidence": 0.65,
+    },
+    "desk": {
+        "length_cm": 120.0,
+        "width_cm": 60.0,
+        "height_cm": 75.0,
+        "description": "Standard office computer / workstation desk",
+        "default_weight_kg": 25.0,
+        "confidence": 0.65,
+    },
 }
 
 
