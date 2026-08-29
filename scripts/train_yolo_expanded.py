@@ -1,0 +1,211 @@
+"""
+train_yolo_expanded.py - Controlled YOLOv8n Training Pipeline on Expanded Dataset
+=================================================================================
+Project: Cargo Vision Logistics System
+Purpose: Trains YOLOv8n on deployment_dataset_expanded/ for 50 epochs with:
+         - Resolution: 640x640
+         - Optimizer: AdamW (lr0=0.001, lrf=0.01, cos_lr=True, weight_decay=0.0005)
+         - Warmup: 3.0 epochs
+         - Augmentations: HSV, rotation (10 deg), translation (0.1), scale (0.2), mosaic=1.0, close_mosaic=8
+         - Evaluates validation split after every epoch
+         - Saves best checkpoint to models/cargo_yolo_expanded_best.pt
+         - Preserves existing checkpoints and datasets.
+"""
+
+import os
+import sys
+import shutil
+import json
+import argparse
+import glob
+from typing import Dict, Any
+
+# Ensure project root is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from ultralytics import YOLO
+
+
+def train_expanded_yolo(
+    data_yaml: str = "deployment_dataset_expanded/data.yaml",
+    base_model: str = "yolov8n.pt",
+    epochs: int = 50,
+    imgsz: int = 640,
+    batch_size: int = 16,
+    lr0: float = 0.001,
+    lrf: float = 0.01,
+    weight_decay: float = 0.0005,
+    warmup_epochs: float = 3.0,
+    close_mosaic: int = 8,
+    project_dir: str = "runs/detect",
+    name: str = "cargo_yolo_expanded",
+    output_model_path: str = "models/cargo_yolo_expanded_best.pt",
+) -> Dict[str, Any]:
+    """
+    Executes controlled YOLOv8n training experiment on deployment_dataset_expanded/.
+    """
+    data_yaml_path = os.path.abspath(data_yaml)
+    if not os.path.exists(data_yaml_path):
+        raise FileNotFoundError(f"data.yaml not found at: {data_yaml_path}")
+
+    os.makedirs(os.path.join(PROJECT_ROOT, "models"), exist_ok=True)
+    os.makedirs(os.path.join(PROJECT_ROOT, "results", "training"), exist_ok=True)
+
+    print("=" * 80)
+    print("CARGO VISION - CONTROLLED YOLOv8n TRAINING EXPERIMENT (EXPANDED DATASET)")
+    print("=" * 80)
+    print(f"Dataset YAML:        {data_yaml_path}")
+    print(f"Model Architecture:  {base_model}")
+    print(f"Target Epochs:       {epochs}")
+    print(f"Image Resolution:    {imgsz}x{imgsz} px")
+    print(f"Batch Size:          {batch_size}")
+    print(f"Optimizer:           AdamW")
+    print(f"Initial LR (lr0):    {lr0}")
+    print(f"Final LR Ratio:      {lrf} (Cosine Annealing)")
+    print(f"Weight Decay:        {weight_decay}")
+    print(f"Warmup Epochs:       {warmup_epochs}")
+    print(f"Close Mosaic Epochs: {close_mosaic}")
+    print(f"Output Checkpoint:   {output_model_path}")
+    print("=" * 80)
+
+    # 1. Initialize YOLO model
+    model = YOLO(base_model)
+
+    # 2. Train model
+    train_results = model.train(
+        data=data_yaml_path,
+        epochs=epochs,
+        imgsz=imgsz,
+        batch=batch_size,
+        lr0=lr0,
+        lrf=lrf,
+        weight_decay=weight_decay,
+        warmup_epochs=warmup_epochs,
+        optimizer="AdamW",
+        cos_lr=True,
+        # Augmentations
+        hsv_h=0.015,
+        hsv_s=0.7,
+        hsv_v=0.4,
+        degrees=10.0,
+        translate=0.1,
+        scale=0.2,
+        fliplr=0.5,
+        mosaic=1.0,
+        close_mosaic=close_mosaic,
+        # Execution & Saving
+        project=project_dir,
+        name=name,
+        exist_ok=True,
+        verbose=True,
+        val=True,
+        save=True,
+        plots=True,
+        workers=0,  # Stable execution on Windows CPU
+    )
+
+    # 3. Locate best weights
+    save_dir = str(getattr(train_results, "save_dir", os.path.join(project_dir, name)))
+    best_weights_path = os.path.join(save_dir, "weights", "best.pt")
+    last_weights_path = os.path.join(save_dir, "weights", "last.pt")
+
+    if not os.path.exists(best_weights_path):
+        found = glob.glob(os.path.join(project_dir, "**", "best.pt"), recursive=True)
+        if found:
+            best_weights_path = found[-1]
+
+    if os.path.exists(best_weights_path):
+        shutil.copy2(best_weights_path, output_model_path)
+        print(f"\n[OK] Copied best weights to: {output_model_path}")
+    elif os.path.exists(last_weights_path):
+        shutil.copy2(last_weights_path, output_model_path)
+        print(f"\n[OK] Copied last weights to: {output_model_path}")
+    else:
+        raise FileNotFoundError(f"Could not locate trained weights in: {save_dir}")
+
+    # 4. Evaluate on HELD-OUT TEST split only
+    print("\n" + "=" * 80)
+    print("EVALUATING EXPANDED MODEL ON HELD-OUT TEST SPLIT...")
+    print("=" * 80)
+    best_model = YOLO(output_model_path)
+    test_metrics = best_model.val(
+        data=data_yaml_path,
+        split="test",
+        imgsz=imgsz,
+        batch=batch_size,
+        verbose=True,
+        workers=0,
+    )
+
+    p = round(float(test_metrics.results_dict.get("metrics/precision(B)", 0.0)), 4)
+    r = round(float(test_metrics.results_dict.get("metrics/recall(B)", 0.0)), 4)
+    map50 = round(float(test_metrics.results_dict.get("metrics/mAP50(B)", 0.0)), 4)
+    map50_95 = round(float(test_metrics.results_dict.get("metrics/mAP50-95(B)", 0.0)), 4)
+
+    # Per-class metrics
+    per_class = {}
+    class_names = getattr(best_model.names, "values", lambda: best_model.names)()
+    if isinstance(best_model.names, dict):
+        names_list = [best_model.names[i] for i in range(len(best_model.names))]
+    else:
+        names_list = list(best_model.names)
+
+    maps_per_class = getattr(test_metrics.box, "maps", [])
+    p_per_class = getattr(test_metrics.box, "p", [])
+    r_per_class = getattr(test_metrics.box, "r", [])
+
+    for i, cname in enumerate(names_list):
+        c_map50 = round(float(maps_per_class[i]), 4) if len(maps_per_class) > i else 0.0
+        c_p = round(float(p_per_class[i]), 4) if len(p_per_class) > i else 0.0
+        c_r = round(float(r_per_class[i]), 4) if len(r_per_class) > i else 0.0
+        per_class[cname] = {
+            "precision": c_p,
+            "recall": c_r,
+            "mAP50": c_map50,
+        }
+
+    summary = {
+        "model_architecture": base_model,
+        "dataset": data_yaml,
+        "classes_count": 24,
+        "epochs_trained": epochs,
+        "image_size": imgsz,
+        "optimizer": "AdamW",
+        "learning_rate_initial": lr0,
+        "learning_rate_final": lr0 * lrf,
+        "weight_decay": weight_decay,
+        "warmup_epochs": warmup_epochs,
+        "close_mosaic": close_mosaic,
+        "output_model_path": output_model_path,
+        "test_metrics": {
+            "precision": p,
+            "recall": r,
+            "mAP50": map50,
+            "mAP50-95": map50_95,
+        },
+        "per_class_metrics": per_class,
+    }
+
+    report_path = os.path.join(PROJECT_ROOT, "results", "training", "cargo_yolo_expanded_eval_report.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"\n[OK] Evaluation report saved to: {report_path}")
+    print(f"Test Precision: {p * 100:.2f}% | Test Recall: {r * 100:.2f}% | Test mAP@50: {map50 * 100:.2f}% | Test mAP@50-95: {map50_95 * 100:.2f}%")
+    return summary
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train YOLOv8n on deployment_dataset_expanded.")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
+    parser.add_argument("--batch", type=int, default=16, help="Batch size")
+    parser.add_argument("--imgsz", type=int, default=640, help="Image resolution")
+    args = parser.parse_args()
+
+    train_expanded_yolo(epochs=args.epochs, batch_size=args.batch, imgsz=args.imgsz)
+
+
+if __name__ == "__main__":
+    main()
