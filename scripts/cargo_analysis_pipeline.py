@@ -3,19 +3,19 @@ cargo_analysis_pipeline.py - Unified Cargo Analysis & Multi-Load Fleet Dispatch 
 =============================================================================================
 Project: Cargo Vision Logistics System
 Purpose: Integrates and orchestrates the complete end-to-end cargo pipeline:
-         1. Image Input Validation (Single & Multi-Load)
+         1. Image Input Validation (Single, Multi-Image, and In-Image Multi-Object Extraction)
          2. Object Detection & Identification (YOLOv8 COCO detector with MobileNetV2 fallback)
-         3. Physical Dimension Estimation (Reference-Marker / Category-Prior Fallback)
-         4. Quantity & Multi-Load Volumetric Calculation (Stacking, Packing Factors, Floor Area)
-         5. Multi-Constraint Vehicle Fleet Recommendation (VehicleDatabase)
+         3. Physical Dimension & Payload Weight Estimation (Category Priors & Marker Measurement)
+         4. Quantity & Multi-Load Volumetric & Weight Calculation (Stacking, Packing Factors, Floor Area)
+         5. Multi-Constraint Vehicle Fleet Recommendation (Dimensions, Volume, Floor Area, Payload Capacity)
 
 Scientific & Accuracy Notice:
 -----------------------------
-1. No Synthetic Data: Uses real trained weights and physical geometric constraints.
+1. No Synthetic Data: Uses real trained weights and physical geometric/weight constraints.
 2. Honest Accuracy Reporting: Exposes component-level confidence scores. The 95% target
    has not yet been validated against a real physical benchmark.
-3. Explicit Warning Generation: Clearly flags prior-estimated dimensions, missing depth axes,
-   and unverified payload weights.
+3. Explicit Warning Generation: Clearly flags prior-estimated dimensions/weights, missing depth axes,
+   and unverified physical scale weights.
 """
 
 import os
@@ -23,6 +23,7 @@ import sys
 import json
 import math
 import argparse
+import textwrap
 from typing import Dict, List, Tuple, Optional, Any, Union
 import numpy as np
 from PIL import Image
@@ -99,7 +100,9 @@ class CargoAnalysisPipeline:
     End-to-End Cargo Vision Analysis and Fleet Dispatch Orchestrator.
     Supports:
       - Single Cargo Item Analysis
-      - Multi-Load Shipment Aggregation
+      - Single-Image Multi-Object Cargo Extraction (`extract_all_objects=True`)
+      - Multi-Load Shipment Aggregation (`analyze_multiple`)
+      - Multi-Constraint Vehicle Selection (Dimensions, Volume, Floor Area, Payload Capacity)
       - Dual vision backends (YOLOv8 COCO detector & MobileNetV2 classification fallback)
     """
 
@@ -162,6 +165,7 @@ class CargoAnalysisPipeline:
         """
         Executes object detection using YOLOv8 COCO model.
         Returns detection summary dictionary and warnings, or None if no valid objects found.
+        Filters out unsupported / non-cargo COCO classes.
         """
         warnings = []
         try:
@@ -179,7 +183,11 @@ class CargoAnalysisPipeline:
                 c_score = float(boxes.conf[i].item())
                 xyxy = boxes.xyxy[i].tolist()
 
-                canonical_class = COCO_TO_CARGO_MAP.get(raw_cls_name, raw_cls_name)
+                # Safely filter out unsupported non-cargo categories
+                if raw_cls_name not in COCO_TO_CARGO_MAP:
+                    continue
+
+                canonical_class = COCO_TO_CARGO_MAP[raw_cls_name]
 
                 detected_items.append({
                     "raw_class": raw_cls_name,
@@ -256,14 +264,19 @@ class CargoAnalysisPipeline:
         dimensions: Dict[str, Optional[float]],
         category: str,
         quantity: int,
+        unit_weight_kg: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         """
-        Calculates unit volume, required total volume, stacking floor area, and cargo footprint.
+        Calculates unit volume, required total volume, stacking floor area, and payload weight.
         """
         warnings = []
         length = dimensions.get("length_cm")
         width = dimensions.get("width_cm")
         height = dimensions.get("height_cm")
+
+        # Resolve weight from argument, dimensions dict, or category prior
+        if unit_weight_kg is None:
+            unit_weight_kg = dimensions.get("weight_kg")
 
         stacking_limit = CATEGORY_STACKING_LIMITS.get(category.lower(), 1)
         packing_factor = CATEGORY_PACKING_FACTORS.get(category.lower(), 0.70)
@@ -271,6 +284,7 @@ class CargoAnalysisPipeline:
         unit_vol_m3 = None
         total_vol_m3 = None
         req_floor_area_m2 = None
+        total_weight_kg = None
 
         if length is not None and width is not None and height is not None:
             # All 3 dimensions are available
@@ -288,10 +302,15 @@ class CargoAnalysisPipeline:
                 "Total cargo volume and floor area cannot be computed because one or more dimensions (e.g. depth/width) are unmeasured."
             )
 
+        if unit_weight_kg is not None:
+            total_weight_kg = round(unit_weight_kg * quantity, 2)
+
         cargo_summary = {
             "total_items": quantity,
             "unit_volume_m3": unit_vol_m3,
             "total_volume_m3": total_vol_m3,
+            "unit_weight_kg": unit_weight_kg,
+            "total_weight_kg": total_weight_kg,
             "stacking_limit_layers": stacking_limit,
             "required_floor_area_m2": req_floor_area_m2,
         }
@@ -306,10 +325,22 @@ class CargoAnalysisPipeline:
         quantity: int,
     ) -> Tuple[Dict[str, Any], List[str]]:
         """
-        Matches single-category cargo requirements against the structured Vehicle Database using hard constraints.
+        Matches single-category cargo requirements against the structured Vehicle Database using hard constraints:
+          1. Physical dimensions fit (length, width, height)
+          2. Usable volume fit
+          3. Floor bed area fit
+          4. Payload weight fit
         """
         warnings = []
-        warnings.append("Payload suitability cannot be verified because physical object weight is unavailable.")
+        total_weight_kg = cargo_summary.get("total_weight_kg")
+        if total_weight_kg is not None:
+            warnings.append(
+                f"Payload suitability cannot be verified against a physical scale; weight ({total_weight_kg:.1f} kg) is estimated from standard category priors."
+            )
+        else:
+            warnings.append(
+                "Payload suitability cannot be verified because physical object weight is unavailable."
+            )
 
         length = dimensions.get("length_cm")
         width = dimensions.get("width_cm")
@@ -337,15 +368,32 @@ class CargoAnalysisPipeline:
             if req_floor_area is not None and req_floor_area > v.floor_area_m2:
                 continue
 
+            # Constraint 4: Payload weight fit
+            if total_weight_kg is not None and total_weight_kg > v.max_payload_kg:
+                continue
+
             suitable_vehicles.append(v)
 
         if not suitable_vehicles:
             # Fallback: cargo exceeds single standard vehicle capacity
             largest_v = all_vehicles[-1]
+            exceeded_reasons = []
+            if total_vol is not None and total_vol > largest_v.usable_volume_m3:
+                exceeded_reasons.append("volume")
+            if req_floor_area is not None and req_floor_area > largest_v.floor_area_m2:
+                exceeded_reasons.append("floor bed area")
+            if total_weight_kg is not None and total_weight_kg > largest_v.max_payload_kg:
+                exceeded_reasons.append("payload weight capacity")
+
+            exceeded_details = f" ({', '.join(exceeded_reasons)})" if exceeded_reasons else ""
+
             return {
                 "vehicle_id": largest_v.vehicle_id,
                 "vehicle_name": largest_v.vehicle_name,
-                "reason": f"Cargo requirement ({quantity} {category}s) exceeds standard single-vehicle capacity. Multi-trip or fleet batching using {largest_v.vehicle_name} is required.",
+                "reason": (
+                    f"Cargo requirement ({quantity} {category}s) exceeds standard single-vehicle capacity{exceeded_details}. "
+                    f"Multi-trip or fleet batching using {largest_v.vehicle_name} is required."
+                ),
                 "alternatives": [],
             }, warnings
 
@@ -359,6 +407,8 @@ class CargoAnalysisPipeline:
             reason_parts.append(f"requiring {total_vol:.2f} m³ usable space (vehicle capacity: {primary_v.usable_volume_m3:.2f} m³)")
         if req_floor_area is not None:
             reason_parts.append(f"and {req_floor_area:.2f} m² floor bed area (vehicle bed: {primary_v.floor_area_m2:.2f} m²)")
+        if total_weight_kg is not None:
+            reason_parts.append(f"with {total_weight_kg:.1f} kg estimated payload (vehicle payload limit: {primary_v.max_payload_kg:.1f} kg)")
         
         reason_str = ", ".join(reason_parts) + "."
 
@@ -376,12 +426,32 @@ class CargoAnalysisPipeline:
         items: List[Dict[str, Any]],
         total_volume_m3: Optional[float],
         total_floor_area_m2: Optional[float],
+        total_weight_kg: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         """
-        Matches multi-item combined cargo shipment requirements against the Vehicle Database.
+        Matches multi-item combined cargo shipment requirements against the Vehicle Database:
+          1. Individual dimension fit (length, width, height)
+          2. Total usable volume fit
+          3. Total floor bed area fit
+          4. Total payload weight fit
         """
         warnings = []
-        warnings.append("Payload suitability cannot be verified because physical object weight is unavailable.")
+        if total_weight_kg is not None:
+            warnings.append(
+                f"Payload suitability cannot be verified against a physical scale; total shipment weight ({total_weight_kg:.1f} kg) is estimated from category priors."
+            )
+        else:
+            warnings.append(
+                "Payload suitability cannot be verified because physical object weight is unavailable."
+            )
+
+        if not items:
+            return {
+                "vehicle_id": None,
+                "vehicle_name": None,
+                "reason": "Shipment is empty. No cargo items to transport.",
+                "alternatives": [],
+            }, ["No cargo items provided for vehicle recommendation."]
 
         all_vehicles = self.vehicle_db.get_all_vehicles()
         suitable_vehicles: List[VehicleSpec] = []
@@ -414,6 +484,10 @@ class CargoAnalysisPipeline:
             if total_floor_area_m2 is not None and total_floor_area_m2 > v.floor_area_m2:
                 continue
 
+            # Constraint 4: Total payload weight fit
+            if total_weight_kg is not None and total_weight_kg > v.max_payload_kg:
+                continue
+
             suitable_vehicles.append(v)
 
         total_quantity = sum(item.get("quantity", 1) for item in items)
@@ -421,12 +495,22 @@ class CargoAnalysisPipeline:
 
         if not suitable_vehicles:
             largest_v = all_vehicles[-1]
+            exceeded_reasons = []
+            if total_volume_m3 is not None and total_volume_m3 > largest_v.usable_volume_m3:
+                exceeded_reasons.append("volume")
+            if total_floor_area_m2 is not None and total_floor_area_m2 > largest_v.floor_area_m2:
+                exceeded_reasons.append("floor bed area")
+            if total_weight_kg is not None and total_weight_kg > largest_v.max_payload_kg:
+                exceeded_reasons.append("payload weight capacity")
+
+            exceeded_details = f" ({', '.join(exceeded_reasons)})" if exceeded_reasons else ""
+
             return {
                 "vehicle_id": largest_v.vehicle_id,
                 "vehicle_name": largest_v.vehicle_name,
                 "reason": (
                     f"Combined shipment ({total_quantity} items: {category_summary_str}) exceeds "
-                    f"standard single-vehicle capacity. Multi-trip or fleet batching using {largest_v.vehicle_name} is required."
+                    f"standard single-vehicle capacity{exceeded_details}. Multi-trip or fleet batching using {largest_v.vehicle_name} is required."
                 ),
                 "alternatives": [],
             }, warnings
@@ -440,6 +524,8 @@ class CargoAnalysisPipeline:
             reason_parts.append(f"requiring {total_volume_m3:.2f} m³ usable space (vehicle capacity: {primary_v.usable_volume_m3:.2f} m³)")
         if total_floor_area_m2 is not None:
             reason_parts.append(f"and {total_floor_area_m2:.2f} m² floor bed area (vehicle bed: {primary_v.floor_area_m2:.2f} m²)")
+        if total_weight_kg is not None:
+            reason_parts.append(f"with {total_weight_kg:.1f} kg estimated payload (vehicle payload limit: {primary_v.max_payload_kg:.1f} kg)")
 
         reason_str = ", ".join(reason_parts) + "."
 
@@ -456,9 +542,18 @@ class CargoAnalysisPipeline:
         quantity: int = 1,
         known_marker_size_cm: Optional[float] = None,
         object_bbox_px: Optional[Tuple[int, int, int, int]] = None,
+        extract_all_objects: bool = False,
     ) -> Dict[str, Any]:
         """
         Executes end-to-end analysis on a single cargo photo.
+
+        Args:
+            image_path: Path to the image file.
+            quantity: Quantity multiplier for single-item mode (default: 1).
+            known_marker_size_cm: Optional ArUco marker size for Mode 1 measurement.
+            object_bbox_px: Optional bounding box override.
+            extract_all_objects: When True, extracts ALL valid detected cargo objects in the image
+                                and aggregates their physical requirements into a combined shipment.
         """
         all_warnings = ["95% target has not yet been validated against a measured physical benchmark."]
 
@@ -485,6 +580,7 @@ class CargoAnalysisPipeline:
         classification_res = None
         detected_category = None
         auto_bbox = None
+        yolo_res = None
 
         if self.detector_backend in ("auto", "yolo"):
             yolo_res, yolo_warnings = self.detect_with_yolo(image_path)
@@ -494,6 +590,116 @@ class CargoAnalysisPipeline:
                 detected_category = yolo_res["class_name"]
                 if object_bbox_px is None and "bounding_box_px" in yolo_res:
                     auto_bbox = tuple(int(round(coord)) for coord in yolo_res["bounding_box_px"])
+
+        # 3b. In-Image Multi-Object Extraction Workflow
+        if extract_all_objects and yolo_res is not None and len(yolo_res.get("all_detections", [])) > 0:
+            all_dets = yolo_res["all_detections"]
+
+            # Group detections by canonical class
+            category_counts: Dict[str, int] = {}
+            category_boxes: Dict[str, List[List[float]]] = {}
+            category_confs: Dict[str, List[float]] = {}
+
+            for d in all_dets:
+                cat = d["canonical_class"]
+                category_counts[cat] = category_counts.get(cat, 0) + 1
+                category_boxes.setdefault(cat, []).append(d["bbox_px"])
+                category_confs.setdefault(cat, []).append(d["confidence"])
+
+            multi_items = []
+            for cat, count in category_counts.items():
+                qty = count * (quantity if quantity > 1 else 1)
+                dim_res = self.dimension_estimator.estimate(category=cat, fallback_to_prior=True)
+                all_warnings.extend(dim_res.warnings)
+
+                dims_dict = {
+                    "status": dim_res.status,
+                    "source": dim_res.source,
+                    "length_cm": dim_res.dimensions_cm.get("length"),
+                    "width_cm": dim_res.dimensions_cm.get("width"),
+                    "height_cm": dim_res.dimensions_cm.get("height"),
+                    "weight_kg": getattr(dim_res, "weight_kg", None),
+                    "confidence": dim_res.confidence,
+                }
+
+                c_sum, c_warn = self.calculate_cargo_requirements(
+                    dimensions=dims_dict,
+                    category=cat,
+                    quantity=qty,
+                    unit_weight_kg=dims_dict.get("weight_kg"),
+                )
+                all_warnings.extend(c_warn)
+
+                avg_conf = round(sum(category_confs[cat]) / len(category_confs[cat]), 4)
+                multi_items.append({
+                    "category": cat,
+                    "quantity": qty,
+                    "confidence": avg_conf,
+                    "detected_instances": count,
+                    "bounding_boxes_px": category_boxes[cat],
+                    "dimensions": dims_dict,
+                    "cargo_summary": c_sum,
+                })
+
+            total_items = sum(item["quantity"] for item in multi_items)
+            volumes = [item["cargo_summary"]["total_volume_m3"] for item in multi_items]
+            floor_areas = [item["cargo_summary"]["required_floor_area_m2"] for item in multi_items]
+            weights = [item["cargo_summary"]["total_weight_kg"] for item in multi_items]
+
+            total_volume_m3 = round(sum(v for v in volumes if v is not None), 4) if all(v is not None for v in volumes) else None
+            total_floor_area_m2 = round(sum(a for a in floor_areas if a is not None), 4) if all(a is not None for a in floor_areas) else None
+            total_weight_kg = round(sum(w for w in weights if w is not None), 2) if all(w is not None for w in weights) else None
+
+            shipment_summary = {
+                "total_items": total_items,
+                "total_volume_m3": total_volume_m3,
+                "total_floor_area_m2": total_floor_area_m2,
+                "total_weight_kg": total_weight_kg,
+                "item_breakdown": [
+                    {
+                        "category": item["category"],
+                        "quantity": item["quantity"],
+                        "unit_volume_m3": item["cargo_summary"]["unit_volume_m3"],
+                        "total_volume_m3": item["cargo_summary"]["total_volume_m3"],
+                        "unit_weight_kg": item["cargo_summary"]["unit_weight_kg"],
+                        "total_weight_kg": item["cargo_summary"]["total_weight_kg"],
+                        "required_floor_area_m2": item["cargo_summary"]["required_floor_area_m2"],
+                        "dimensions_cm": {
+                            "length": item["dimensions"]["length_cm"],
+                            "width": item["dimensions"]["width_cm"],
+                            "height": item["dimensions"]["height_cm"],
+                        },
+                    }
+                    for item in multi_items
+                ],
+            }
+
+            vehicle_rec, veh_warnings = self.recommend_vehicle_for_shipment(
+                items=multi_items,
+                total_volume_m3=total_volume_m3,
+                total_floor_area_m2=total_floor_area_m2,
+                total_weight_kg=total_weight_kg,
+            )
+            all_warnings.extend(veh_warnings)
+
+            # Deduplicate warnings while preserving order
+            seen_w = set()
+            deduped_warnings = []
+            for w in all_warnings:
+                if w not in seen_w:
+                    seen_w.add(w)
+                    deduped_warnings.append(w)
+
+            return {
+                "status": "SUCCESS",
+                "mode": "SINGLE_IMAGE_MULTI_OBJECT",
+                "input_image": os.path.abspath(image_path),
+                "detected_objects": multi_items,
+                "total_items": total_items,
+                "shipment_summary": shipment_summary,
+                "vehicle_recommendation": vehicle_rec,
+                "warnings": deduped_warnings,
+            }
 
         # Fallback to MobileNetV2 if YOLO did not detect any object or backend is mobilenetv2
         if classification_res is None:
@@ -517,7 +723,7 @@ class CargoAnalysisPipeline:
                     "warnings": all_warnings,
                 }
 
-        # 4. Dimension Estimation
+        # 4. Dimension & Weight Estimation
         effective_bbox = object_bbox_px if object_bbox_px is not None else auto_bbox
         dim_res = self.dimension_estimator.estimate(
             image_input=image_path if known_marker_size_cm is not None and effective_bbox is not None else None,
@@ -534,6 +740,7 @@ class CargoAnalysisPipeline:
             "length_cm": dim_res.dimensions_cm.get("length"),
             "width_cm": dim_res.dimensions_cm.get("width"),
             "height_cm": dim_res.dimensions_cm.get("height"),
+            "weight_kg": getattr(dim_res, "weight_kg", None),
             "confidence": dim_res.confidence,
         }
 
@@ -542,6 +749,7 @@ class CargoAnalysisPipeline:
             dimensions=dimensions_dict,
             category=detected_category,
             quantity=quantity,
+            unit_weight_kg=dimensions_dict.get("weight_kg"),
         )
         all_warnings.extend(cargo_warnings)
 
@@ -623,24 +831,29 @@ class CargoAnalysisPipeline:
             }
             shipment_items.append(item_entry)
 
-        # Volumetric & Space Aggregation
+        # Volumetric, Weight & Space Aggregation
         total_items = sum(item["quantity"] for item in shipment_items)
         volumes = [item["cargo_summary"]["total_volume_m3"] for item in shipment_items]
         floor_areas = [item["cargo_summary"]["required_floor_area_m2"] for item in shipment_items]
+        weights = [item["cargo_summary"]["total_weight_kg"] for item in shipment_items]
 
         total_volume_m3 = round(sum(v for v in volumes if v is not None), 4) if all(v is not None for v in volumes) else None
         total_floor_area_m2 = round(sum(a for a in floor_areas if a is not None), 4) if all(a is not None for a in floor_areas) else None
+        total_weight_kg = round(sum(w for w in weights if w is not None), 2) if all(w is not None for w in weights) else None
 
         shipment_summary = {
             "total_items": total_items,
             "total_volume_m3": total_volume_m3,
             "total_floor_area_m2": total_floor_area_m2,
+            "total_weight_kg": total_weight_kg,
             "item_breakdown": [
                 {
                     "category": item["category"],
                     "quantity": item["quantity"],
                     "unit_volume_m3": item["cargo_summary"]["unit_volume_m3"],
                     "total_volume_m3": item["cargo_summary"]["total_volume_m3"],
+                    "unit_weight_kg": item["cargo_summary"]["unit_weight_kg"],
+                    "total_weight_kg": item["cargo_summary"]["total_weight_kg"],
                     "required_floor_area_m2": item["cargo_summary"]["required_floor_area_m2"],
                     "dimensions_cm": {
                         "length": item["dimensions"]["length_cm"],
@@ -657,6 +870,7 @@ class CargoAnalysisPipeline:
             items=shipment_items,
             total_volume_m3=total_volume_m3,
             total_floor_area_m2=total_floor_area_m2,
+            total_weight_kg=total_weight_kg,
         )
         all_warnings.extend(veh_warnings)
 
@@ -689,6 +903,7 @@ def main():
     parser.add_argument("--images", type=str, nargs="+", default=None, help="Paths to multiple cargo image files for multi-load aggregation.")
     parser.add_argument("--quantity", type=int, default=1, help="Quantity of items for single image mode (default: 1).")
     parser.add_argument("--quantities", type=int, nargs="+", default=None, help="Quantities corresponding to --images list.")
+    parser.add_argument("--extract-all", action="store_true", help="Extract and aggregate all detected cargo objects in a single image.")
     parser.add_argument("--backend", type=str, default="auto", choices=["auto", "yolo", "mobilenetv2"],
                         help="Vision backend: 'auto' (YOLO with MobileNetV2 fallback), 'yolo', or 'mobilenetv2'.")
     parser.add_argument("--marker-size", type=float, default=None, help="Optional known physical marker size in cm.")
@@ -734,34 +949,41 @@ def main():
             qty = item["quantity"]
             dims = item["dimensions"]
             c_sum = item["cargo_summary"]
-            dim_str = f"{dims['length_cm']} x {dims['width_cm']} x {dims['height_cm']} cm" if dims['length_cm'] else "Unmeasured"
-            vol_str = f"{c_sum['total_volume_m3']:.4f} m³" if c_sum['total_volume_m3'] else "N/A"
-            print(f"{idx+1:>2}. {cat:<16} x{qty:<3} (Unit: {dim_str}, Total Vol: {vol_str})")
+            dim_str = f"{dims['length_cm']} x {dims['width_cm']} x {dims['height_cm']} cm" if dims.get('length_cm') else "Unmeasured"
+            vol_str = f"{c_sum['total_volume_m3']:.4f} m³" if c_sum.get('total_volume_m3') else "N/A"
+            wt_str = f"{c_sum['total_weight_kg']:.1f} kg" if c_sum.get('total_weight_kg') is not None else "N/A"
+            print(f"{idx+1:>2}. {cat:<16} x{qty:<3} (Unit: {dim_str}, Vol: {vol_str}, Wt: {wt_str})")
 
         print(f"\nTOTAL ITEMS:      {result['total_items']}")
-        print(f"TOTAL VOLUME:     {summary['total_volume_m3']:.4f} m³" if summary['total_volume_m3'] else "TOTAL VOLUME:     N/A")
-        print(f"TOTAL FLOOR AREA: {summary['total_floor_area_m2']:.4f} m²" if summary['total_floor_area_m2'] else "TOTAL FLOOR AREA: N/A")
+        print(f"TOTAL VOLUME:     {summary['total_volume_m3']:.4f} m³" if summary.get('total_volume_m3') else "TOTAL VOLUME:     N/A")
+        print(f"TOTAL FLOOR AREA: {summary['total_floor_area_m2']:.4f} m²" if summary.get('total_floor_area_m2') else "TOTAL FLOOR AREA: N/A")
+        print(f"TOTAL WEIGHT:     {summary['total_weight_kg']:.2f} kg (estimated)" if summary.get('total_weight_kg') is not None else "TOTAL WEIGHT:     N/A")
         print("-" * 78)
         print("RECOMMENDED VEHICLE")
         print("-" * 78)
         print(f"Vehicle:          {rec['vehicle_name']}")
         print(f"Vehicle ID:       {rec['vehicle_id']}")
-        print(f"Reason:           {rec['reason']}")
+        reason_text = textwrap.fill(rec['reason'], width=76, initial_indent="Reason:           ", subsequent_indent="                  ")
+        print(reason_text)
         if rec.get("alternatives"):
-            print(f"Alternatives:     {', '.join(rec['alternatives'])}")
+            alts_str = ", ".join(rec["alternatives"])
+            alts_text = textwrap.fill(alts_str, width=76, initial_indent="Alternatives:     ", subsequent_indent="                  ")
+            print(alts_text)
         print("-" * 78)
         print("IMPORTANT NOTICES & DISCLAIMERS:")
         for w in result["warnings"]:
-            print(f"  * {w}")
+            w_text = textwrap.fill(f"* {w}", width=76, initial_indent="  ", subsequent_indent="    ")
+            print(w_text)
         print("=" * 78)
         return
 
-    # Single-Image Mode (Preserved exactly)
+    # Single-Image Mode (Single Object or In-Image Multi-Object)
     result = pipeline.analyze(
         image_path=args.image,
         quantity=args.quantity,
         known_marker_size_cm=args.marker_size,
         object_bbox_px=tuple(args.bbox) if args.bbox else None,
+        extract_all_objects=args.extract_all,
     )
 
     if args.json:
@@ -777,6 +999,52 @@ def main():
         print("=" * 78)
         return
 
+    # Single-Image Multi-Object Report
+    if result.get("mode") == "SINGLE_IMAGE_MULTI_OBJECT":
+        rec = result["vehicle_recommendation"]
+        summary = result["shipment_summary"]
+
+        print("\n" + "=" * 78)
+        print("CARGO VISION - SINGLE-IMAGE MULTI-OBJECT DISPATCH REPORT")
+        print("=" * 78)
+        print(f"Input Image:           {result['input_image']}")
+        print("\nDETECTED OBJECTS")
+        print("-" * 78)
+        for idx, item in enumerate(result["detected_objects"]):
+            cat = item["category"].capitalize()
+            qty = item["quantity"]
+            dims = item["dimensions"]
+            c_sum = item["cargo_summary"]
+            conf = item["confidence"]
+            dim_str = f"{dims['length_cm']} x {dims['width_cm']} x {dims['height_cm']} cm" if dims.get('length_cm') else "Unmeasured"
+            vol_str = f"{c_sum['total_volume_m3']:.4f} m³" if c_sum.get('total_volume_m3') else "N/A"
+            wt_str = f"{c_sum['total_weight_kg']:.1f} kg" if c_sum.get('total_weight_kg') is not None else "N/A"
+            print(f"{idx+1:>2}. {cat:<16} x{qty:<3} (Conf: {conf:.1%}, Unit: {dim_str}, Vol: {vol_str}, Wt: {wt_str})")
+
+        print(f"\nTOTAL ITEMS:      {result['total_items']}")
+        print(f"TOTAL VOLUME:     {summary['total_volume_m3']:.4f} m³" if summary.get('total_volume_m3') else "TOTAL VOLUME:     N/A")
+        print(f"TOTAL FLOOR AREA: {summary['total_floor_area_m2']:.4f} m²" if summary.get('total_floor_area_m2') else "TOTAL FLOOR AREA: N/A")
+        print(f"TOTAL WEIGHT:     {summary['total_weight_kg']:.2f} kg (estimated)" if summary.get('total_weight_kg') is not None else "TOTAL WEIGHT:     N/A")
+        print("-" * 78)
+        print("RECOMMENDED VEHICLE")
+        print("-" * 78)
+        print(f"Vehicle:          {rec['vehicle_name']}")
+        print(f"Vehicle ID:       {rec['vehicle_id']}")
+        reason_text = textwrap.fill(rec['reason'], width=76, initial_indent="Reason:           ", subsequent_indent="                  ")
+        print(reason_text)
+        if rec.get("alternatives"):
+            alts_str = ", ".join(rec["alternatives"])
+            alts_text = textwrap.fill(alts_str, width=76, initial_indent="Alternatives:     ", subsequent_indent="                  ")
+            print(alts_text)
+        print("-" * 78)
+        print("IMPORTANT NOTICES & DISCLAIMERS:")
+        for w in result["warnings"]:
+            w_text = textwrap.fill(f"* {w}", width=76, initial_indent="  ", subsequent_indent="    ")
+            print(w_text)
+        print("=" * 78)
+        return
+
+    # Single-Load Report (Standard Single Item Mode)
     cls_info = result["classification"]
     dim_info = result["dimensions"]
     summary = result["cargo_summary"]
@@ -793,26 +1061,33 @@ def main():
     print("-" * 78)
     print("PHYSICAL DIMENSION ESTIMATE:")
     print(f"  - Status:            {dim_info['status']} ({dim_info['source']})")
-    print(f"  - Length:            {dim_info['length_cm']:.1f} cm" if dim_info['length_cm'] is not None else "  - Length:            None")
-    print(f"  - Width (Depth):     {dim_info['width_cm']:.1f} cm" if dim_info['width_cm'] is not None else "  - Width (Depth):     None")
-    print(f"  - Height:            {dim_info['height_cm']:.1f} cm" if dim_info['height_cm'] is not None else "  - Height:            None")
+    print(f"  - Length:            {dim_info['length_cm']:.1f} cm" if dim_info.get('length_cm') is not None else "  - Length:            None")
+    print(f"  - Width (Depth):     {dim_info['width_cm']:.1f} cm" if dim_info.get('width_cm') is not None else "  - Width (Depth):     None")
+    print(f"  - Height:            {dim_info['height_cm']:.1f} cm" if dim_info.get('height_cm') is not None else "  - Height:            None")
     print(f"  - Dimension Conf:    {dim_info['confidence']:.1%}")
     print("-" * 78)
     print("CARGO VOLUME & SPACE REQUIREMENTS:")
-    print(f"  - Unit Volume:       {summary['unit_volume_m3']} m³" if summary['unit_volume_m3'] is not None else "  - Unit Volume:       None")
-    print(f"  - Total Req Volume:  {summary['total_volume_m3']} m³ (adjusted for packing)" if summary['total_volume_m3'] is not None else "  - Total Req Volume:  None")
-    print(f"  - Floor Area Bed:    {summary['required_floor_area_m2']} m² (max {summary['stacking_limit_layers']} stack layers)" if summary['required_floor_area_m2'] is not None else "  - Floor Area Bed:    None")
+    print(f"  - Unit Volume:       {summary['unit_volume_m3']} m³" if summary.get('unit_volume_m3') is not None else "  - Unit Volume:       None")
+    print(f"  - Total Req Volume:  {summary['total_volume_m3']} m³ (adjusted for packing)" if summary.get('total_volume_m3') is not None else "  - Total Req Volume:  None")
+    print(f"  - Floor Area Bed:    {summary['required_floor_area_m2']} m² (max {summary['stacking_limit_layers']} stack layers)" if summary.get('required_floor_area_m2') is not None else "  - Floor Area Bed:    None")
+    if summary.get("unit_weight_kg") is not None:
+        print(f"  - Unit Weight:       {summary['unit_weight_kg']:.1f} kg (estimated category prior)")
+        print(f"  - Total Weight:      {summary['total_weight_kg']:.1f} kg")
     print("-" * 78)
     print("FLEET RECOMMENDATION:")
     print(f"  - Recommended:       {rec['vehicle_name']}")
     print(f"  - Vehicle ID:        {rec['vehicle_id']}")
-    print(f"  - Reason:            {rec['reason']}")
+    reason_text = textwrap.fill(rec['reason'], width=76, initial_indent="  - Reason:            ", subsequent_indent="                       ")
+    print(reason_text)
     if rec.get("alternatives"):
-        print(f"  - Alternatives:      {', '.join(rec['alternatives'])}")
+        alts_str = ", ".join(rec["alternatives"])
+        alts_text = textwrap.fill(alts_str, width=76, initial_indent="  - Alternatives:      ", subsequent_indent="                       ")
+        print(alts_text)
     print("-" * 78)
     print("IMPORTANT NOTICES & DISCLAIMERS:")
     for w in result["warnings"]:
-        print(f"  * {w}")
+        w_text = textwrap.fill(f"* {w}", width=76, initial_indent="  ", subsequent_indent="    ")
+        print(w_text)
     print("=" * 78)
 
 
