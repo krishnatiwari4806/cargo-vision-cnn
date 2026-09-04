@@ -62,6 +62,7 @@ class DimensionEstimateResult:
     dimensions_cm: Dict[str, Optional[float]]
     confidence: float
     scale_cm_per_pixel: Optional[float] = None
+    weight_kg: Optional[float] = None
     reference: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
@@ -200,6 +201,7 @@ class CategoryPriorEstimator:
         width = float(prior["width_cm"])
         height = float(prior["height_cm"])
         conf = float(prior.get("confidence", 0.60))
+        weight = float(prior["default_weight_kg"]) if "default_weight_kg" in prior and prior["default_weight_kg"] is not None else None
 
         warnings = [
             f"Dimensions for '{cat_key}' are estimated from standard category priors ({prior.get('description', '')}).",
@@ -217,6 +219,7 @@ class CategoryPriorEstimator:
             },
             confidence=conf,
             scale_cm_per_pixel=None,
+            weight_kg=round(weight, 2) if weight is not None else None,
             reference={"type": "category_prior", "size_cm": None, "detected": False},
             warnings=warnings,
         )
