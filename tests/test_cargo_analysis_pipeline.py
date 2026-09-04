@@ -326,6 +326,303 @@ class TestCargoAnalysisPipeline(unittest.TestCase):
         for warning in res["warnings"]:
             self.assertNotIn("No objects detected by YOLO detector above confidence threshold", warning)
 
+    # -------------------------------------------------------------------------
+    # 18. Payload Weight: Small Volume but Heavy Weight Upgrades Vehicle
+    # -------------------------------------------------------------------------
+    def test_payload_weight_constraint_upgrades_overloaded_vehicle(self):
+        """Verify a shipment with small volume but payload exceeding vehicle limit upgrades to a higher payload vehicle."""
+        # Dimensions fit 3-Wheeler Auto (145x130x120 cm, 2.26 m3, 1.88 m2 bed), but weight = 700 kg > 500 kg limit of Auto
+        items = [
+            {"category": "box", "quantity": 10, "dimensions": {"length_cm": 50.0, "width_cm": 40.0, "height_cm": 30.0}},
+        ]
+        # Total volume: 0.5 m3, floor area: 0.5 m2, weight: 700.0 kg
+        rec, _ = self.pipeline.recommend_vehicle_for_shipment(
+            items=items,
+            total_volume_m3=0.5,
+            total_floor_area_m2=0.5,
+            total_weight_kg=700.0,
+        )
+        # V_3W_AUTO (max 500 kg) must be rejected due to payload weight.
+        # V_TATA_ACE (max 850 kg) must be selected.
+        self.assertEqual(rec["vehicle_id"], "V_TATA_ACE")
+        self.assertIn("700.0 kg estimated payload", rec["reason"])
+
+    # -------------------------------------------------------------------------
+    # 19. Payload Weight: Quantity Scales Total Weight Correctly
+    # -------------------------------------------------------------------------
+    def test_quantity_scales_payload_weight(self):
+        """Verify quantity multiplier correctly scales total payload weight."""
+        dims = {"length_cm": 45.0, "width_cm": 35.0, "height_cm": 30.0, "weight_kg": 12.0}
+        cargo_sum, _ = self.pipeline.calculate_cargo_requirements(dims, "box", quantity=5)
+        self.assertEqual(cargo_sum["unit_weight_kg"], 12.0)
+        self.assertEqual(cargo_sum["total_weight_kg"], 60.0)
+
+    # -------------------------------------------------------------------------
+    # 20. Payload Weight: Mixed-Load Weight Aggregation
+    # -------------------------------------------------------------------------
+    def test_mixed_load_payload_weight_aggregation(self):
+        """Verify mixed cargo shipment sums individual item weights correctly."""
+        # 1 refrigerator (75 kg) + 2 TVs (2*15 = 30 kg) + 4 boxes (4*12 = 48 kg) = 153 kg
+        refrig_dims = {"length_cm": 70.0, "width_cm": 70.0, "height_cm": 175.0, "weight_kg": 75.0}
+        tv_dims = {"length_cm": 120.0, "width_cm": 15.0, "height_cm": 75.0, "weight_kg": 15.0}
+        box_dims = {"length_cm": 45.0, "width_cm": 35.0, "height_cm": 30.0, "weight_kg": 12.0}
+
+        refrig_sum, _ = self.pipeline.calculate_cargo_requirements(refrig_dims, "refrigerator", 1)
+        tv_sum, _ = self.pipeline.calculate_cargo_requirements(tv_dims, "tv", 2)
+        box_sum, _ = self.pipeline.calculate_cargo_requirements(box_dims, "box", 4)
+
+        expected_total_weight = round(refrig_sum["total_weight_kg"] + tv_sum["total_weight_kg"] + box_sum["total_weight_kg"], 2)
+        self.assertEqual(expected_total_weight, 153.0)
+
+    # -------------------------------------------------------------------------
+    # 21. Payload Weight: Heavy Shipment Exceeding All Vehicle Payloads
+    # -------------------------------------------------------------------------
+    def test_heavy_shipment_exceeding_fleet_payload_capacity(self):
+        """Verify massive payload weight exceeding fleet maximum returns batching advice indicating payload."""
+        items = [
+            {"category": "car", "quantity": 20, "dimensions": {"length_cm": 450.0, "width_cm": 180.0, "height_cm": 145.0}},
+        ]
+        # Total weight 20 * 1400 = 28,000 kg > 20,000 kg max carrier payload
+        rec, _ = self.pipeline.recommend_vehicle_for_shipment(
+            items=items,
+            total_volume_m3=50.0,
+            total_floor_area_m2=30.0,
+            total_weight_kg=28000.0,
+        )
+        self.assertEqual(rec["vehicle_id"], "V_CAR_CARRIER_MULTI")
+        self.assertIn("payload weight capacity", rec["reason"])
+
+    # -------------------------------------------------------------------------
+    # 22. Payload Weight: Honest Weight Disclaimer
+    # -------------------------------------------------------------------------
+    def test_payload_weight_disclaimer_preserves_honesty(self):
+        """Verify disclaimers state that payload weight is estimated and not measured on a scale."""
+        res = self.pipeline.analyze(self.valid_image_path, quantity=1)
+        warnings_str = " ".join(res["warnings"])
+        self.assertIn("Payload suitability cannot be verified", warnings_str)
+        self.assertIn("estimated from standard category priors", warnings_str)
+
+    # -------------------------------------------------------------------------
+    # 23. Single-Image Multi-Object Extraction on Real Image
+    # -------------------------------------------------------------------------
+    def test_single_image_multi_object_extraction_real_image(self):
+        """Verify extract_all_objects=True extracts all valid cargo objects from a single photo."""
+        multi_img_path = os.path.join(PROJECT_ROOT, "deployment_dataset_expanded", "test", "images", "coco_000000057238.jpg")
+        if not os.path.exists(multi_img_path):
+            self.skipTest("coco_000000057238.jpg not present on disk.")
+
+        pipeline_yolo = CargoAnalysisPipeline(detector_backend="auto")
+        res = pipeline_yolo.analyze(multi_img_path, extract_all_objects=True)
+
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["mode"], "SINGLE_IMAGE_MULTI_OBJECT")
+        self.assertIn("detected_objects", res)
+        self.assertGreaterEqual(len(res["detected_objects"]), 2)
+
+        # Check detected categories include refrigerator, chair, table
+        detected_cats = {item["category"] for item in res["detected_objects"]}
+        self.assertIn("refrigerator", detected_cats)
+        self.assertIn("chair", detected_cats)
+
+        # Total items count should reflect multiple instances (e.g. 3 chairs + 1 refrig + 1 table = 5)
+        self.assertGreaterEqual(res["total_items"], 4)
+        self.assertGreater(res["shipment_summary"]["total_volume_m3"], 2.0)
+        self.assertGreater(res["shipment_summary"]["total_weight_kg"], 100.0)
+        self.assertIsNotNone(res["vehicle_recommendation"]["vehicle_id"])
+
+    # -------------------------------------------------------------------------
+    # 24. Single-Image Multi-Object: Duplicate Categories Aggregated Correctly
+    # -------------------------------------------------------------------------
+    def test_single_image_multi_object_duplicate_categories_aggregated(self):
+        """Verify multiple instances of the same category in one image are aggregated by quantity."""
+        multi_img_path = os.path.join(PROJECT_ROOT, "deployment_dataset_expanded", "test", "images", "coco_000000057238.jpg")
+        if not os.path.exists(multi_img_path):
+            self.skipTest("coco_000000057238.jpg not present on disk.")
+
+        pipeline_yolo = CargoAnalysisPipeline(detector_backend="auto")
+        res = pipeline_yolo.analyze(multi_img_path, extract_all_objects=True)
+
+        chair_entries = [item for item in res["detected_objects"] if item["category"] == "chair"]
+        # There should be exactly 1 aggregated chair entry with quantity >= 2
+        self.assertEqual(len(chair_entries), 1)
+        self.assertGreaterEqual(chair_entries[0]["quantity"], 2)
+        self.assertEqual(chair_entries[0]["detected_instances"], chair_entries[0]["quantity"])
+
+    # -------------------------------------------------------------------------
+    # 25. Single-Image Multi-Object: Unsupported Non-Cargo Detections Ignored
+    # -------------------------------------------------------------------------
+    def test_single_image_multi_object_unsupported_detections_ignored(self):
+        """Verify non-cargo COCO objects like remotes, cups, dogs, persons are excluded from cargo list."""
+        # Image with couch and remote: deployment_dataset_expanded/test/images/coco_000000290771.jpg
+        img_path = os.path.join(PROJECT_ROOT, "deployment_dataset_expanded", "test", "images", "coco_000000290771.jpg")
+        if not os.path.exists(img_path):
+            self.skipTest("coco_000000290771.jpg not present on disk.")
+
+        pipeline_yolo = CargoAnalysisPipeline(detector_backend="auto")
+        res = pipeline_yolo.analyze(img_path, extract_all_objects=True)
+
+        self.assertEqual(res["status"], "SUCCESS")
+        detected_cats = {item["category"] for item in res["detected_objects"]}
+        # Remote or person must NOT appear in cargo objects
+        self.assertNotIn("remote", detected_cats)
+        self.assertNotIn("person", detected_cats)
+        self.assertIn("couch", detected_cats)
+
+    # -------------------------------------------------------------------------
+    # 26. Single-Image Multi-Object: Default extract_all_objects=False Preserved
+    # -------------------------------------------------------------------------
+    def test_single_image_multi_object_default_false_preserves_single_load(self):
+        """Verify default extract_all_objects=False returns SINGLE_LOAD mode with primary object."""
+        car_img_path = os.path.join(PROJECT_ROOT, "data", "car.jpg")
+        if not os.path.exists(car_img_path):
+            self.skipTest("data/car.jpg not present on disk.")
+
+        pipeline_yolo = CargoAnalysisPipeline(detector_backend="auto")
+        res = pipeline_yolo.analyze(car_img_path, quantity=1, extract_all_objects=False)
+
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["mode"], "SINGLE_LOAD")
+        self.assertEqual(res["classification"]["class_name"], "car")
+        self.assertEqual(res["vehicle_recommendation"]["vehicle_id"], "V_EICHER_19FT")
+
+    # -------------------------------------------------------------------------
+    # 27. Single-Image Multi-Object: Single CAR Image in Extract-All Mode
+    # -------------------------------------------------------------------------
+    def test_single_image_multi_object_on_single_car_image(self):
+        """Verify extract_all_objects=True on an image with 1 car produces 1-item multi-object breakdown."""
+        car_img_path = os.path.join(PROJECT_ROOT, "data", "car.jpg")
+        if not os.path.exists(car_img_path):
+            self.skipTest("data/car.jpg not present on disk.")
+
+        pipeline_yolo = CargoAnalysisPipeline(detector_backend="auto")
+        res = pipeline_yolo.analyze(car_img_path, quantity=1, extract_all_objects=True)
+
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["mode"], "SINGLE_IMAGE_MULTI_OBJECT")
+        self.assertEqual(len(res["detected_objects"]), 1)
+        self.assertEqual(res["detected_objects"][0]["category"], "car")
+        self.assertEqual(res["shipment_summary"]["total_weight_kg"], 1400.0)
+        self.assertEqual(res["vehicle_recommendation"]["vehicle_id"], "V_EICHER_19FT")
+
+    # -------------------------------------------------------------------------
+    # 28. Payload Limit: 50 Boxes x 12 kg = 600 kg Excludes 3-Wheeler Auto
+    # -------------------------------------------------------------------------
+    def test_fifty_boxes_payload_weight_eliminates_sub_600kg_vehicles(self):
+        """Verify 50 boxes * 12 kg = 600 kg rejects 3-Wheeler Auto (500 kg limit) and selects Tata Ace."""
+        box_dims = {"length_cm": 45.0, "width_cm": 35.0, "height_cm": 30.0, "weight_kg": 12.0}
+        cargo_sum, _ = self.pipeline.calculate_cargo_requirements(box_dims, "box", quantity=50)
+
+        self.assertEqual(cargo_sum["total_weight_kg"], 600.0)
+        # Volume for 50 boxes: 50 * 0.04725 / 0.80 = 2.953 m3
+        # 3-Wheeler Auto (payload 500 kg) must be eliminated because 600 kg > 500 kg.
+        # Tata Ace (payload 850 kg, volume 4.78 m3) must accommodate it.
+        rec, _ = self.pipeline.recommend_vehicle(
+            category="box",
+            dimensions=box_dims,
+            cargo_summary=cargo_sum,
+            quantity=50,
+        )
+        self.assertNotEqual(rec["vehicle_id"], "V_3W_AUTO")
+        self.assertEqual(rec["vehicle_id"], "V_TATA_ACE")
+        self.assertIn("600.0 kg estimated payload", rec["reason"])
+
+    # -------------------------------------------------------------------------
+    # 29. Multi-Load: Quantities and Images Length Mismatch Returns Error
+    # -------------------------------------------------------------------------
+    def test_multiload_mismatched_images_and_quantities_returns_error(self):
+        """Verify mismatched lengths between image_paths and quantities returns structured error."""
+        res = self.pipeline.analyze_multiple(
+            image_paths=[self.valid_image_path, self.valid_image_path],
+            quantities=[1],  # 1 quantity for 2 images
+        )
+        self.assertEqual(res["status"], "ERROR")
+        self.assertIn("Length of quantities (1) must match length of image_paths (2)", res["error"])
+
+    # -------------------------------------------------------------------------
+    # 30. Empty Shipment Handling
+    # -------------------------------------------------------------------------
+    def test_empty_shipment_handling_produces_no_fake_recommendation(self):
+        """Verify empty image lists or empty item lists return error / clean reason without recommending a vehicle."""
+        # 1. analyze_multiple with empty list
+        res_empty = self.pipeline.analyze_multiple([])
+        self.assertEqual(res_empty["status"], "ERROR")
+        self.assertIn("image_paths must be a non-empty list", res_empty["error"])
+
+        # 2. recommend_vehicle_for_shipment with empty items list
+        rec, warnings = self.pipeline.recommend_vehicle_for_shipment(items=[], total_volume_m3=0.0, total_floor_area_m2=0.0)
+        self.assertIsNone(rec["vehicle_id"])
+        self.assertIn("Shipment is empty", rec["reason"])
+
+    # -------------------------------------------------------------------------
+    # 31. Constraint: Weight Fits but Floor Area Exceeds Eliminates Vehicle
+    # -------------------------------------------------------------------------
+    def test_floor_area_constraint_eliminates_underdimensioned_bed(self):
+        """Verify floor area exceeding vehicle bed area eliminates vehicle even when weight and volume fit."""
+        # 3 items requiring 2.5 m2 bed area, 1.2 m3 volume, 30.0 kg weight
+        # 3-Wheeler Auto has 1.88 m2 floor bed area -> eliminated!
+        # Tata Ace has 3.19 m2 floor bed area -> selected!
+        items = [
+            {"category": "chair", "quantity": 3, "dimensions": {"length_cm": 60.0, "width_cm": 60.0, "height_cm": 90.0}},
+        ]
+        rec, _ = self.pipeline.recommend_vehicle_for_shipment(
+            items=items,
+            total_volume_m3=1.2,
+            total_floor_area_m2=2.50,
+            total_weight_kg=30.0,
+        )
+        self.assertNotEqual(rec["vehicle_id"], "V_3W_AUTO")
+        self.assertEqual(rec["vehicle_id"], "V_TATA_ACE")
+        self.assertIn("2.50 m² floor bed area", rec["reason"])
+
+    # -------------------------------------------------------------------------
+    # 32. Constraint: Height Exceeding Usable Clearance Eliminates Vehicle
+    # -------------------------------------------------------------------------
+    def test_item_height_exceeding_clearance_eliminates_vehicle(self):
+        """Verify an item with height 175 cm eliminates 3-Wheeler Auto (120 cm) and Tata Ace (145 cm)."""
+        items = [
+            {"category": "refrigerator", "quantity": 1, "dimensions": {"length_cm": 70.0, "width_cm": 70.0, "height_cm": 175.0}},
+        ]
+        rec, _ = self.pipeline.recommend_vehicle_for_shipment(
+            items=items,
+            total_volume_m3=1.0,
+            total_floor_area_m2=0.49,
+            total_weight_kg=75.0,
+        )
+        # Auto (120 cm) and Tata Ace (145 cm) must be eliminated
+        self.assertNotIn(rec["vehicle_id"], ["V_3W_AUTO", "V_TATA_ACE"])
+        self.assertEqual(rec["vehicle_id"], "V_BOLERO_PICKUP")
+
+    # -------------------------------------------------------------------------
+    # 33. Multi-Image 3-CAR Shipment Aggregation Regression
+    # -------------------------------------------------------------------------
+    def test_three_car_multi_image_aggregation_regression(self):
+        """Verify 3 separate car items aggregate into 35.235 m3, 24.3 m2, 4200 kg and recommend V_CAR_CARRIER_MULTI."""
+        car_dims = {"length_cm": 450.0, "width_cm": 180.0, "height_cm": 145.0, "weight_kg": 1400.0}
+        car_sum, _ = self.pipeline.calculate_cargo_requirements(car_dims, "car", quantity=1)
+
+        items = [
+            {"category": "car", "quantity": 1, "dimensions": car_dims, "cargo_summary": car_sum},
+            {"category": "car", "quantity": 1, "dimensions": car_dims, "cargo_summary": car_sum},
+            {"category": "car", "quantity": 1, "dimensions": car_dims, "cargo_summary": car_sum},
+        ]
+
+        total_vol = round(car_sum["total_volume_m3"] * 3, 4)
+        total_area = round(car_sum["required_floor_area_m2"] * 3, 4)
+        total_wt = round(car_sum["total_weight_kg"] * 3, 2)
+
+        self.assertEqual(total_vol, 35.235)
+        self.assertEqual(total_area, 24.3)
+        self.assertEqual(total_wt, 4200.0)
+
+        rec, _ = self.pipeline.recommend_vehicle_for_shipment(
+            items=items,
+            total_volume_m3=total_vol,
+            total_floor_area_m2=total_area,
+            total_weight_kg=total_wt,
+        )
+        self.assertEqual(rec["vehicle_id"], "V_CAR_CARRIER_MULTI")
+        self.assertIn("Accommodates combined shipment (3 items:", rec["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()
