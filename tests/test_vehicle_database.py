@@ -154,6 +154,31 @@ class TestVehicleDatabase(unittest.TestCase):
         self.assertEqual(len(parsed_json), 6)
         self.assertEqual(parsed_json[0]["vehicle_id"], "V_3W_AUTO")
 
+    def test_vehicle_semantic_compatibility(self):
+        """Verify semantic compatibility rules for general freight vs specialized car carrier."""
+        car_carrier = self.db.get_vehicle_by_id("V_CAR_CARRIER_MULTI")
+        self.assertIsNotNone(car_carrier)
+        self.assertEqual(car_carrier.vehicle_type, "specialized_car_carrier")
+
+        # Car carrier accepts car/vehicle cargo
+        self.assertTrue(car_carrier.is_compatible_with_cargo("car"))
+        self.assertTrue(car_carrier.is_compatible_with_cargo("SUV"))
+        self.assertTrue(car_carrier.is_compatible_with_cargo("automobile"))
+
+        # Car carrier rejects non-car cargo
+        for non_car in ["refrigerator", "box", "bed", "chair", "table", "couch", "desk", "tv"]:
+            self.assertFalse(
+                car_carrier.is_compatible_with_cargo(non_car),
+                f"Car carrier should not be compatible with {non_car}",
+            )
+
+        # General freight vehicles accept general cargo
+        for v_id in ["V_3W_AUTO", "V_TATA_ACE", "V_BOLERO_PICKUP", "V_TATA_407_14FT", "V_EICHER_19FT"]:
+            v = self.db.get_vehicle_by_id(v_id)
+            self.assertEqual(v.vehicle_type, "general_freight")
+            self.assertTrue(v.is_compatible_with_cargo("box"))
+            self.assertTrue(v.is_compatible_with_cargo("refrigerator"))
+
 
 if __name__ == "__main__":
     unittest.main()
