@@ -745,6 +745,125 @@ class TestCargoAnalysisPipeline(unittest.TestCase):
         self.assertNotIn(rec["vehicle_id"], ["V_3W_AUTO", "V_TATA_ACE", "V_BOLERO_PICKUP"])
         self.assertEqual(rec["vehicle_id"], "V_TATA_407_14FT")
 
+    # -------------------------------------------------------------------------
+    # 39. Semantic Compatibility: Car Carrier Accepts Car Cargo
+    # -------------------------------------------------------------------------
+    def test_car_carrier_accepts_car_cargo(self):
+        """Verify specialized car carrier is semantically eligible for single and multi-car cargo."""
+        car_dims = {"length_cm": 450.0, "width_cm": 180.0, "height_cm": 145.0, "weight_kg": 1400.0}
+        car_sum, _ = self.pipeline.calculate_cargo_requirements(car_dims, "car", quantity=1)
+
+        # Single CAR: V_EICHER_19FT is primary, V_CAR_CARRIER_MULTI is valid alternative
+        rec_single, _ = self.pipeline.recommend_vehicle("car", car_dims, car_sum, quantity=1)
+        self.assertEqual(rec_single["vehicle_id"], "V_EICHER_19FT")
+        self.assertIn("Dedicated Multi-Car Carrier (Double-Deck Trailer)", rec_single["alternatives"])
+
+        # 3 CARs: V_CAR_CARRIER_MULTI is primary
+        items = [
+            {"category": "car", "quantity": 1, "dimensions": car_dims},
+            {"category": "car", "quantity": 1, "dimensions": car_dims},
+            {"category": "car", "quantity": 1, "dimensions": car_dims},
+        ]
+        rec_multi, _ = self.pipeline.recommend_vehicle_for_shipment(
+            items=items,
+            total_volume_m3=35.235,
+            total_floor_area_m2=24.3,
+            total_weight_kg=4200.0,
+        )
+        self.assertEqual(rec_multi["vehicle_id"], "V_CAR_CARRIER_MULTI")
+
+    # -------------------------------------------------------------------------
+    # 40. Semantic Compatibility: Car Carrier Rejects Non-Car Single Cargo
+    # -------------------------------------------------------------------------
+    def test_car_carrier_rejects_non_car_cargo(self):
+        """Verify non-car items (refrigerator, box, bed, chair, table) never recommend car carrier."""
+        test_cases = [
+            ("refrigerator", {"length_cm": 70.0, "width_cm": 70.0, "height_cm": 175.0, "weight_kg": 75.0}),
+            ("box", {"length_cm": 50.0, "width_cm": 40.0, "height_cm": 30.0, "weight_kg": 15.0}),
+            ("bed", {"length_cm": 200.0, "width_cm": 160.0, "height_cm": 60.0, "weight_kg": 50.0}),
+            ("chair", {"length_cm": 60.0, "width_cm": 60.0, "height_cm": 90.0, "weight_kg": 8.5}),
+            ("table", {"length_cm": 120.0, "width_cm": 75.0, "height_cm": 75.0, "weight_kg": 25.0}),
+        ]
+
+        for cat, dims in test_cases:
+            c_sum, _ = self.pipeline.calculate_cargo_requirements(dims, cat, quantity=1)
+            rec, _ = self.pipeline.recommend_vehicle(cat, dims, c_sum, quantity=1)
+            self.assertNotEqual(
+                rec["vehicle_id"],
+                "V_CAR_CARRIER_MULTI",
+                f"Car carrier was incorrectly recommended as primary for {cat}",
+            )
+            self.assertNotIn(
+                "Dedicated Multi-Car Carrier (Double-Deck Trailer)",
+                rec["alternatives"],
+                f"Car carrier was incorrectly included as alternative for {cat}",
+            )
+
+    # -------------------------------------------------------------------------
+    # 41. Semantic Compatibility: Car Carrier Rejects Mixed Non-Car Shipments
+    # -------------------------------------------------------------------------
+    def test_car_carrier_rejects_mixed_non_car_shipments(self):
+        """Verify multi-load shipments with only non-car items strictly reject V_CAR_CARRIER_MULTI."""
+        refrig_dims = {"length_cm": 70.0, "width_cm": 70.0, "height_cm": 175.0, "weight_kg": 75.0}
+        box_dims = {"length_cm": 45.0, "width_cm": 35.0, "height_cm": 30.0, "weight_kg": 12.0}
+        bed_dims = {"length_cm": 200.0, "width_cm": 160.0, "height_cm": 60.0, "weight_kg": 50.0}
+        chair_dims = {"length_cm": 60.0, "width_cm": 60.0, "height_cm": 90.0, "weight_kg": 8.5}
+
+        # Shipment 1: Refrigerator + Box + Bed
+        shipment_1 = [
+            {"category": "refrigerator", "quantity": 1, "dimensions": refrig_dims},
+            {"category": "box", "quantity": 4, "dimensions": box_dims},
+            {"category": "bed", "quantity": 1, "dimensions": bed_dims},
+        ]
+        rec1, _ = self.pipeline.recommend_vehicle_for_shipment(
+            items=shipment_1,
+            total_volume_m3=4.5,
+            total_floor_area_m2=4.0,
+            total_weight_kg=173.0,
+        )
+        self.assertNotEqual(rec1["vehicle_id"], "V_CAR_CARRIER_MULTI")
+        self.assertNotIn("Dedicated Multi-Car Carrier (Double-Deck Trailer)", rec1["alternatives"])
+
+        # Shipment 2: Refrigerator + Bed + Chair
+        shipment_2 = [
+            {"category": "refrigerator", "quantity": 1, "dimensions": refrig_dims},
+            {"category": "bed", "quantity": 2, "dimensions": bed_dims},
+            {"category": "chair", "quantity": 4, "dimensions": chair_dims},
+        ]
+        rec2, _ = self.pipeline.recommend_vehicle_for_shipment(
+            items=shipment_2,
+            total_volume_m3=8.4883,
+            total_floor_area_m2=7.61,
+            total_weight_kg=209.0,
+        )
+        self.assertEqual(rec2["vehicle_id"], "V_TATA_407_14FT")
+        self.assertNotIn("Dedicated Multi-Car Carrier (Double-Deck Trailer)", rec2["alternatives"])
+
+    # -------------------------------------------------------------------------
+    # 42. Semantic Compatibility: Generic Freight Vehicle Selected When Fitting
+    # -------------------------------------------------------------------------
+    def test_generic_freight_vehicle_selected_for_fitting_non_car_cargo(self):
+        """Verify generic freight trucks (e.g. Tata 407, Eicher 19ft) are selected when non-car cargo fits."""
+        couch_dims = {"length_cm": 210.0, "width_cm": 90.0, "height_cm": 85.0, "weight_kg": 70.0}
+        cargo_sum, _ = self.pipeline.calculate_cargo_requirements(couch_dims, "couch", quantity=5)
+        rec, _ = self.pipeline.recommend_vehicle("couch", couch_dims, cargo_sum, quantity=5)
+        self.assertIn(rec["vehicle_id"], ["V_TATA_407_14FT", "V_EICHER_19FT"])
+        self.assertNotIn("Dedicated Multi-Car Carrier (Double-Deck Trailer)", rec["alternatives"])
+
+    # -------------------------------------------------------------------------
+    # 43. Semantic Compatibility: Cannot Be Overridden By Volume/Payload/Dimensions
+    # -------------------------------------------------------------------------
+    def test_semantic_incompatibility_cannot_be_overridden_by_volume_or_payload(self):
+        """Verify huge non-car cargo exceeding single standard vehicle capacity falls back to Eicher 19ft, not Car Carrier."""
+        refrig_dims = {"length_cm": 70.0, "width_cm": 70.0, "height_cm": 175.0, "weight_kg": 75.0}
+        cargo_sum, _ = self.pipeline.calculate_cargo_requirements(refrig_dims, "refrigerator", quantity=50)
+
+        rec, _ = self.pipeline.recommend_vehicle("refrigerator", refrig_dims, cargo_sum, quantity=50)
+        self.assertEqual(rec["vehicle_id"], "V_EICHER_19FT")
+        self.assertIn("exceeds standard single-vehicle capacity", rec["reason"])
+        self.assertIn("using 19-ft Medium Freight Truck", rec["reason"])
+        self.assertNotIn("Dedicated Multi-Car Carrier", rec["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()
