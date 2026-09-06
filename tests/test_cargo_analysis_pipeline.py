@@ -931,6 +931,100 @@ class TestCargoAnalysisPipeline(unittest.TestCase):
         self.assertEqual(res["status"], "SUCCESS")
         self.assertEqual(res["classification"]["class_name"], "refrigerator")
 
+    # -------------------------------------------------------------------------
+    # 48. BUG #4 Regression: High-Confidence Detections Are Marked RELIABLE
+    # -------------------------------------------------------------------------
+    def test_high_confidence_detections_marked_reliable(self):
+        """Verify high-confidence Box, Car, and Refrigerator detections receive RELIABLE status."""
+        # Box test
+        box_path = os.path.join(PROJECT_ROOT, "data", "box8.jpg")
+        if os.path.exists(box_path):
+            res_box = self.pipeline.analyze(box_path, quantity=1)
+            self.assertEqual(res_box["status"], "SUCCESS")
+            self.assertEqual(res_box["reliability"], "RELIABLE")
+            self.assertGreaterEqual(res_box["classification"]["confidence"], 0.50)
+
+        # Car test
+        car_path = os.path.join(PROJECT_ROOT, "data", "car.jpg")
+        if os.path.exists(car_path):
+            res_car = self.pipeline.analyze(car_path, quantity=1)
+            self.assertEqual(res_car["status"], "SUCCESS")
+            self.assertEqual(res_car["reliability"], "RELIABLE")
+            self.assertGreaterEqual(res_car["classification"]["confidence"], 0.50)
+
+        # Refrigerator test
+        refrig_path = os.path.join(PROJECT_ROOT, "data", "refrigeratorx10.jpg")
+        if os.path.exists(refrig_path):
+            res_ref = self.pipeline.analyze(refrig_path, quantity=1)
+            self.assertEqual(res_ref["status"], "SUCCESS")
+            self.assertEqual(res_ref["reliability"], "RELIABLE")
+            self.assertGreaterEqual(res_ref["classification"]["confidence"], 0.50)
+
+    # -------------------------------------------------------------------------
+    # 49. BUG #4 Regression: Low-Confidence Detections Marked REVIEW_REQUIRED
+    # -------------------------------------------------------------------------
+    def test_low_confidence_detection_marked_review_required(self):
+        """Verify detections below 50% confidence receive REVIEW_REQUIRED and generate explicit warning."""
+        chair_path = os.path.join(
+            PROJECT_ROOT,
+            "deployment_dataset_expanded",
+            "test",
+            "images",
+            "orig_train_Chair_16_JPG.rf.0261cecaf9b0251cdfb8d7cdf50d7988.jpg",
+        )
+        if not os.path.exists(chair_path):
+            self.skipTest("Chair test image not found in workspace")
+
+        res = self.pipeline.analyze(chair_path, quantity=1)
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertLess(res["classification"]["confidence"], 0.50)
+        self.assertEqual(res["reliability"], "REVIEW_REQUIRED")
+        self.assertEqual(res["classification"]["reliability"], "REVIEW_REQUIRED")
+
+        # Explicit warning must be present
+        warnings_joined = " ".join(res["warnings"])
+        self.assertIn("below reliable threshold", warnings_joined)
+        self.assertIn("Manual verification recommended", warnings_joined)
+
+    # -------------------------------------------------------------------------
+    # 50. BUG #4 Regression: Multi-Object Low-Confidence Objects Handled Safely
+    # -------------------------------------------------------------------------
+    def test_multi_object_low_confidence_table_flagged_for_review(self):
+        """Verify multi-object extraction tags low-confidence table as REVIEW_REQUIRED while preserving reliable objects."""
+        multi_img = os.path.join(PROJECT_ROOT, "deployment_dataset_expanded", "test", "images", "coco_000000057238.jpg")
+        if not os.path.exists(multi_img):
+            self.skipTest("coco_000000057238.jpg not found in workspace")
+
+        res = self.pipeline.analyze(multi_img, extract_all_objects=True)
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["mode"], "SINGLE_IMAGE_MULTI_OBJECT")
+
+        detected_map = {item["category"]: item for item in res["detected_objects"]}
+        self.assertIn("refrigerator", detected_map)
+        self.assertIn("chair", detected_map)
+        self.assertIn("table", detected_map)
+
+        # High-confidence items
+        self.assertEqual(detected_map["refrigerator"]["reliability"], "RELIABLE")
+        self.assertTrue(detected_map["refrigerator"]["is_dispatch_ready"])
+        self.assertEqual(detected_map["chair"]["reliability"], "RELIABLE")
+        self.assertTrue(detected_map["chair"]["is_dispatch_ready"])
+
+        # Low-confidence item (~29% Table)
+        self.assertEqual(detected_map["table"]["reliability"], "REVIEW_REQUIRED")
+        self.assertFalse(detected_map["table"]["is_dispatch_ready"])
+
+        # Reliability breakdown in shipment summary
+        breakdown = res["shipment_summary"]["reliability_breakdown"]
+        self.assertEqual(breakdown["reliable_items_count"], 3)  # 1 refrig + 2 chairs
+        self.assertEqual(breakdown["review_required_items_count"], 1)  # 1 table
+        self.assertIn("table", breakdown["review_required_categories"])
+
+        # Warnings include explicit review notification
+        warnings_str = " ".join(res["warnings"])
+        self.assertIn("Low-confidence cargo detected: 'table'", warnings_str)
+        self.assertIn("marked REVIEW_REQUIRED", warnings_str)
+
 
 if __name__ == "__main__":
     unittest.main()
