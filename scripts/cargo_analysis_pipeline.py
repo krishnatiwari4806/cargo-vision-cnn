@@ -232,6 +232,46 @@ def _dimensions_fit_vehicle(
     return True
 
 
+# Categories identifying motorized / rolling vehicles
+VEHICLE_CARGO_CATEGORIES: set = {
+    "car",
+    "automobile",
+    "suv",
+    "vehicle",
+    "sedan",
+    "truck",
+    "van",
+}
+
+
+def _is_vehicle_compatible_with_category(vehicle: VehicleSpec, category: Optional[str]) -> bool:
+    """
+    Validates semantic compatibility between a vehicle specification and a cargo category.
+    Specialized vehicles (e.g. car carriers) require matching vehicle cargo.
+    """
+    if hasattr(vehicle, "is_compatible_with_cargo"):
+        return vehicle.is_compatible_with_cargo(category)
+    if category is None:
+        return True
+    if vehicle.vehicle_id == "V_CAR_CARRIER_MULTI" or getattr(vehicle, "vehicle_type", "") == "specialized_car_carrier":
+        return category.strip().lower() in VEHICLE_CARGO_CATEGORIES
+    return True
+
+
+def _is_vehicle_compatible_with_shipment(vehicle: VehicleSpec, items: List[Dict[str, Any]]) -> bool:
+    """
+    Validates semantic compatibility between a vehicle specification and a multi-item shipment.
+    Specialized vehicles (e.g. car carriers) require at least one vehicle/car cargo item in the shipment.
+    """
+    if hasattr(vehicle, "is_compatible_with_shipment"):
+        return vehicle.is_compatible_with_shipment(items)
+    if not items:
+        return True
+    if vehicle.vehicle_id == "V_CAR_CARRIER_MULTI" or getattr(vehicle, "vehicle_type", "") == "specialized_car_carrier":
+        return any(item.get("category", "").strip().lower() in VEHICLE_CARGO_CATEGORIES for item in items)
+    return True
+
+
 # -----------------------------------------------------------------------------
 # Unified Pipeline Class
 # -----------------------------------------------------------------------------
@@ -243,11 +283,13 @@ class CargoAnalysisPipeline:
       - Single Cargo Item Analysis
       - Single-Image Multi-Object Cargo Extraction (`extract_all_objects=True`)
       - Multi-Load Shipment Aggregation (`analyze_multiple`)
-      - Multi-Constraint Vehicle Selection (Dimensions, Volume, Floor Area, Payload Capacity)
+      - Multi-Constraint Vehicle Selection (Semantic, Dimensions, Volume, Floor Area, Payload Capacity)
       - Dual vision backends (YOLOv8 COCO detector & MobileNetV2 classification fallback)
     """
 
     _dimensions_fit_vehicle = staticmethod(_dimensions_fit_vehicle)
+    _is_vehicle_compatible_with_category = staticmethod(_is_vehicle_compatible_with_category)
+    _is_vehicle_compatible_with_shipment = staticmethod(_is_vehicle_compatible_with_shipment)
 
     def __init__(
         self,
@@ -495,6 +537,10 @@ class CargoAnalysisPipeline:
         suitable_vehicles: List[VehicleSpec] = []
 
         for v in all_vehicles:
+            # Constraint 0: Semantic compatibility fit
+            if not _is_vehicle_compatible_with_category(v, category):
+                continue
+
             # Constraint 1: Single item physical dimension fit (with valid rotation support)
             if not _dimensions_fit_vehicle(dimensions, v, allow_rotation=True, category=category):
                 continue
@@ -515,7 +561,8 @@ class CargoAnalysisPipeline:
 
         if not suitable_vehicles:
             # Fallback: cargo exceeds single standard vehicle capacity
-            largest_v = all_vehicles[-1]
+            compatible_vehicles = [v for v in all_vehicles if _is_vehicle_compatible_with_category(v, category)]
+            largest_v = compatible_vehicles[-1] if compatible_vehicles else all_vehicles[-1]
             exceeded_reasons = []
             if not _dimensions_fit_vehicle(dimensions, largest_v, allow_rotation=True, category=category):
                 exceeded_reasons.append("physical dimensions")
@@ -598,6 +645,10 @@ class CargoAnalysisPipeline:
         suitable_vehicles: List[VehicleSpec] = []
 
         for v in all_vehicles:
+            # Constraint 0: Semantic compatibility fit
+            if not _is_vehicle_compatible_with_shipment(v, items):
+                continue
+
             # Constraint 1: Every individual item's dimensions must fit inside vehicle (with valid rotation)
             fits_dimensions = True
             for item in items:
@@ -627,7 +678,8 @@ class CargoAnalysisPipeline:
         category_summary_str = ", ".join(f"{item.get('quantity', 1)} {item.get('category', 'item')}(s)" for item in items)
 
         if not suitable_vehicles:
-            largest_v = all_vehicles[-1]
+            compatible_vehicles = [v for v in all_vehicles if _is_vehicle_compatible_with_shipment(v, items)]
+            largest_v = compatible_vehicles[-1] if compatible_vehicles else all_vehicles[-1]
             exceeded_reasons = []
             dim_exceeded = any(
                 not _dimensions_fit_vehicle(item.get("dimensions", {}), largest_v, allow_rotation=True, category=item.get("category"))
