@@ -864,6 +864,74 @@ class TestCargoAnalysisPipeline(unittest.TestCase):
         self.assertIn("using 19-ft Medium Freight Truck", rec["reason"])
         self.assertNotIn("Dedicated Multi-Car Carrier", rec["reason"])
 
+    # -------------------------------------------------------------------------
+    # 44. BUG #3 Regression: Box Image Detection and Classification
+    # -------------------------------------------------------------------------
+    def test_box_image_detection_and_classification_regression(self):
+        """Verify real box image (data/box8.jpg) is correctly classified as box (not chair) and recommends light vehicle."""
+        box_img_path = os.path.join(PROJECT_ROOT, "data", "box8.jpg")
+        if not os.path.exists(box_img_path):
+            self.skipTest("data/box8.jpg not found in workspace")
+
+        res = self.pipeline.analyze(box_img_path, quantity=8)
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["classification"]["class_name"], "box")
+        self.assertNotEqual(res["classification"]["class_name"], "chair")
+        self.assertGreaterEqual(res["classification"]["confidence"], 0.50)
+
+        # 8 boxes (45x35x30 cm, 12 kg each = 96 kg payload) should easily fit in 3-Wheeler Auto
+        rec = res["vehicle_recommendation"]
+        self.assertEqual(rec["vehicle_id"], "V_3W_AUTO")
+        self.assertIn("box", rec["reason"].lower())
+
+    # -------------------------------------------------------------------------
+    # 45. BUG #3 Regression: High-Confidence Genuine Chair Remains Chair
+    # -------------------------------------------------------------------------
+    def test_genuine_chair_detection_remains_chair(self):
+        """Verify genuine chair image is correctly detected and classified as chair."""
+        chair_img_path = os.path.join(
+            PROJECT_ROOT,
+            "deployment_dataset_expanded",
+            "test",
+            "images",
+            "orig_train_Chair_16_JPG.rf.0261cecaf9b0251cdfb8d7cdf50d7988.jpg",
+        )
+        if not os.path.exists(chair_img_path):
+            self.skipTest("Chair test image not found in workspace")
+
+        res = self.pipeline.analyze(chair_img_path, quantity=1)
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["classification"]["class_name"], "chair")
+        self.assertNotEqual(res["classification"]["class_name"], "box")
+
+    # -------------------------------------------------------------------------
+    # 46. BUG #3 Regression: Car Image Detection Preservation
+    # -------------------------------------------------------------------------
+    def test_car_detection_preservation(self):
+        """Verify car image (data/car.jpg) is correctly detected as car and dispatched to Eicher 19ft."""
+        car_img_path = os.path.join(PROJECT_ROOT, "data", "car.jpg")
+        if not os.path.exists(car_img_path):
+            self.skipTest("data/car.jpg not found in workspace")
+
+        res = self.pipeline.analyze(car_img_path, quantity=1)
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["classification"]["class_name"], "car")
+        self.assertEqual(res["vehicle_recommendation"]["vehicle_id"], "V_EICHER_19FT")
+
+    # -------------------------------------------------------------------------
+    # 47. BUG #3 Regression: Refrigerator Image Detection Preservation
+    # -------------------------------------------------------------------------
+    def test_refrigerator_detection_preservation(self):
+        """Verify refrigerator image (data/refrigeratorx10.jpg) is correctly detected as refrigerator."""
+        refrig_img_path = os.path.join(PROJECT_ROOT, "data", "refrigeratorx10.jpg")
+        if not os.path.exists(refrig_img_path):
+            self.skipTest("data/refrigeratorx10.jpg not found in workspace")
+
+        res = self.pipeline.analyze(refrig_img_path, quantity=1)
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["classification"]["class_name"], "refrigerator")
+
 
 if __name__ == "__main__":
     unittest.main()
+
