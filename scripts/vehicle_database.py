@@ -35,6 +35,8 @@ class VehicleSpec:
     max_payload_kg: float
     body_type: str
     suitable_cargo_types: List[str] = field(default_factory=list)
+    vehicle_type: str = "general_freight"
+    compatible_cargo_types: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         # Validate non-negative physical values
@@ -50,6 +52,38 @@ class VehicleSpec:
             raise ValueError(f"floor_area_m2 must be positive, got {self.floor_area_m2}")
         if self.max_payload_kg <= 0:
             raise ValueError(f"max_payload_kg must be positive, got {self.max_payload_kg}")
+
+    def is_compatible_with_cargo(self, category: Optional[str]) -> bool:
+        """
+        Determines whether this vehicle is semantically compatible with a given cargo category.
+        Specialized vehicles (e.g. car carriers) accept only vehicle/car cargo.
+        General freight vehicles accept general freight and standard cargo categories.
+        """
+        if category is None:
+            return True
+        cat_clean = category.strip().lower()
+        vehicle_cargo_types = {"car", "automobile", "suv", "vehicle", "truck", "van", "sedan"}
+
+        if self.vehicle_type == "specialized_car_carrier" or self.vehicle_id == "V_CAR_CARRIER_MULTI":
+            if cat_clean in vehicle_cargo_types:
+                return True
+            if any(c.lower() == cat_clean or c.lower() in cat_clean or cat_clean in c.lower() for c in self.compatible_cargo_types):
+                return True
+            return False
+
+        return True
+
+    def is_compatible_with_shipment(self, items: List[Dict[str, Any]]) -> bool:
+        """
+        Determines whether this vehicle is semantically compatible with a multi-item shipment.
+        For specialized car carriers, the shipment must contain at least one vehicle/car item.
+        """
+        if not items:
+            return True
+        if self.vehicle_type == "specialized_car_carrier" or self.vehicle_id == "V_CAR_CARRIER_MULTI":
+            vehicle_cargo_types = {"car", "automobile", "suv", "vehicle", "truck", "van", "sedan"}
+            return any(item.get("category", "").strip().lower() in vehicle_cargo_types for item in items)
+        return True
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes vehicle specification to dictionary."""
@@ -73,6 +107,8 @@ DEFAULT_VEHICLE_CATALOG: List[VehicleSpec] = [
         max_payload_kg=500.0,
         body_type="covered_box",
         suitable_cargo_types=["box", "suitcase", "stool", "small_appliances", "cartons", "parcels"],
+        vehicle_type="general_freight",
+        compatible_cargo_types=["box", "suitcase", "stool", "small_appliances", "cartons", "parcels"],
     ),
     VehicleSpec(
         vehicle_id="V_TATA_ACE",
@@ -86,6 +122,8 @@ DEFAULT_VEHICLE_CATALOG: List[VehicleSpec] = [
         max_payload_kg=850.0,
         body_type="open_or_closed_bed",
         suitable_cargo_types=["box", "chair", "table", "washing_machine", "refrigerator", "desk", "small_furniture"],
+        vehicle_type="general_freight",
+        compatible_cargo_types=["box", "chair", "table", "washing_machine", "refrigerator", "desk", "small_furniture"],
     ),
     VehicleSpec(
         vehicle_id="V_BOLERO_PICKUP",
@@ -99,6 +137,8 @@ DEFAULT_VEHICLE_CATALOG: List[VehicleSpec] = [
         max_payload_kg=1500.0,
         body_type="flatbed_tarpaulin",
         suitable_cargo_types=["couch", "dining_table", "bed", "furniture_sets", "heavy_crates", "office_equipment"],
+        vehicle_type="general_freight",
+        compatible_cargo_types=["couch", "dining_table", "bed", "furniture_sets", "heavy_crates", "office_equipment"],
     ),
     VehicleSpec(
         vehicle_id="V_TATA_407_14FT",
@@ -112,6 +152,8 @@ DEFAULT_VEHICLE_CATALOG: List[VehicleSpec] = [
         max_payload_kg=3500.0,
         body_type="closed_container",
         suitable_cargo_types=["apartment_relocation", "bulk_boxes", "commercial_freight", "multiple_couches", "industrial_goods"],
+        vehicle_type="general_freight",
+        compatible_cargo_types=["apartment_relocation", "bulk_boxes", "commercial_freight", "multiple_couches", "industrial_goods"],
     ),
     VehicleSpec(
         vehicle_id="V_EICHER_19FT",
@@ -125,6 +167,8 @@ DEFAULT_VEHICLE_CATALOG: List[VehicleSpec] = [
         max_payload_kg=7500.0,
         body_type="heavy_container",
         suitable_cargo_types=["industrial_machinery", "car_single", "bulk_distribution", "multi_room_furniture", "heavy_pallets"],
+        vehicle_type="general_freight",
+        compatible_cargo_types=["industrial_machinery", "car_single", "bulk_distribution", "multi_room_furniture", "heavy_pallets"],
     ),
     VehicleSpec(
         vehicle_id="V_CAR_CARRIER_MULTI",
@@ -138,6 +182,8 @@ DEFAULT_VEHICLE_CATALOG: List[VehicleSpec] = [
         max_payload_kg=20000.0,
         body_type="double_deck_open_ramp",
         suitable_cargo_types=["car", "suv", "automobile_batch", "vehicles"],
+        vehicle_type="specialized_car_carrier",
+        compatible_cargo_types=["car", "suv", "automobile", "automobile_batch", "vehicles"],
     ),
 ]
 
@@ -176,9 +222,10 @@ class VehicleDatabase:
         min_floor_area_m2: float = 0.0,
         min_payload_kg: float = 0.0,
         cargo_type: Optional[str] = None,
+        vehicle_type: Optional[str] = None,
     ) -> List[VehicleSpec]:
         """
-        Filters vehicles satisfying all specified physical dimensional and payload thresholds.
+        Filters vehicles satisfying all specified physical dimensional, payload, and compatibility thresholds.
         """
         matches = []
         for v in self._catalog:
@@ -194,10 +241,10 @@ class VehicleDatabase:
                 continue
             if v.max_payload_kg < min_payload_kg:
                 continue
-            if cargo_type is not None:
-                # Check if cargo_type is explicitly in suitable_cargo_types or generic matches
-                if cargo_type.lower() not in [c.lower() for c in v.suitable_cargo_types]:
-                    pass # Non-strict filtering on cargo type
+            if vehicle_type is not None and v.vehicle_type != vehicle_type:
+                continue
+            if cargo_type is not None and not v.is_compatible_with_cargo(cargo_type):
+                continue
             matches.append(v)
         return matches
 
