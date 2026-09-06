@@ -103,6 +103,16 @@ COCO_TO_CARGO_MAP: Dict[str, str] = {
     "desk": "desk",
 }
 
+# -----------------------------------------------------------------------------
+# Reliability and Confidence Policy Thresholds
+# -----------------------------------------------------------------------------
+# Detections strictly below MIN_CONFIDENCE_THRESHOLD are rejected as detector noise
+MIN_CONFIDENCE_THRESHOLD: float = 0.25
+
+# Detections at or above RELIABLE_CONFIDENCE_THRESHOLD are considered reliable for automated dispatch
+RELIABLE_CONFIDENCE_THRESHOLD: float = 0.50
+
+
 
 # -----------------------------------------------------------------------------
 # 3D Cargo Dimension & Physical Fit Helpers
@@ -453,6 +463,14 @@ class CargoAnalysisPipeline:
 
             primary = filtered_detections[0]
             primary_instances = [d for d in filtered_detections if d["canonical_class"] == primary["canonical_class"]]
+            primary_conf = primary["confidence"]
+            primary_reliability = "RELIABLE" if primary_conf >= RELIABLE_CONFIDENCE_THRESHOLD else "REVIEW_REQUIRED"
+
+            if primary_reliability == "REVIEW_REQUIRED":
+                warnings.append(
+                    f"Detection confidence for '{primary['canonical_class']}' ({primary_conf:.1%}) is below reliable threshold ({RELIABLE_CONFIDENCE_THRESHOLD:.1%}). "
+                    "Manual verification recommended before fleet dispatch."
+                )
 
             detection_res = {
                 "class_name": primary["canonical_class"],
@@ -462,6 +480,7 @@ class CargoAnalysisPipeline:
                 "bounding_box_px": primary["bbox_px"],
                 "detected_instance_count": len(primary_instances),
                 "all_detections": filtered_detections,
+                "reliability": primary_reliability,
                 "probabilities": {primary["canonical_class"]: primary["confidence"]},
             }
 
@@ -486,22 +505,24 @@ class CargoAnalysisPipeline:
         pred_idx = int(np.argmax(probs))
         pred_class = TARGET_CLASSES[pred_idx]
         confidence = float(probs[pred_idx])
+        reliability = "RELIABLE" if confidence >= RELIABLE_CONFIDENCE_THRESHOLD else "REVIEW_REQUIRED"
 
         probabilities = {
             TARGET_CLASSES[i]: round(float(probs[i]), 4)
             for i in range(len(TARGET_CLASSES))
         }
 
-        if confidence < 0.50:
+        if reliability == "REVIEW_REQUIRED":
             warnings.append(
-                f"Classification confidence ({confidence:.1%}) is low. "
-                "Image may be ambiguous, poorly lit, or out-of-distribution."
+                f"Classification confidence for '{pred_class}' ({confidence:.1%}) is below reliable threshold ({RELIABLE_CONFIDENCE_THRESHOLD:.1%}). "
+                "Image may be ambiguous, poorly lit, or out-of-distribution; manual review recommended."
             )
 
         classification_res = {
             "class_name": pred_class,
             "confidence": round(confidence, 4),
             "detector_backend": "mobilenetv2",
+            "reliability": reliability,
             "probabilities": probabilities,
         }
 
@@ -861,6 +882,7 @@ class CargoAnalysisPipeline:
                 category_confs.setdefault(cat, []).append(d["confidence"])
 
             multi_items = []
+            review_required_items = []
             for cat, count in category_counts.items():
                 qty = count * (quantity if quantity > 1 else 1)
                 dim_res = self.dimension_estimator.estimate(category=cat, fallback_to_prior=True)
@@ -885,10 +907,22 @@ class CargoAnalysisPipeline:
                 all_warnings.extend(c_warn)
 
                 avg_conf = round(sum(category_confs[cat]) / len(category_confs[cat]), 4)
+                item_reliability = "RELIABLE" if avg_conf >= RELIABLE_CONFIDENCE_THRESHOLD else "REVIEW_REQUIRED"
+                is_dispatch_ready = (item_reliability == "RELIABLE")
+
+                if item_reliability == "REVIEW_REQUIRED":
+                    review_required_items.append(cat)
+                    all_warnings.append(
+                        f"Low-confidence cargo detected: '{cat}' ({avg_conf:.1%}) is marked REVIEW_REQUIRED. "
+                        "Verify presence before finalizing vehicle dispatch."
+                    )
+
                 multi_items.append({
                     "category": cat,
                     "quantity": qty,
                     "confidence": avg_conf,
+                    "reliability": item_reliability,
+                    "is_dispatch_ready": is_dispatch_ready,
                     "detected_instances": count,
                     "bounding_boxes_px": category_boxes[cat],
                     "dimensions": dims_dict,
@@ -904,15 +938,26 @@ class CargoAnalysisPipeline:
             total_floor_area_m2 = round(sum(a for a in floor_areas if a is not None), 4) if all(a is not None for a in floor_areas) else None
             total_weight_kg = round(sum(w for w in weights if w is not None), 2) if all(w is not None for w in weights) else None
 
+            reliable_count = sum(item["quantity"] for item in multi_items if item["reliability"] == "RELIABLE")
+            review_count = sum(item["quantity"] for item in multi_items if item["reliability"] == "REVIEW_REQUIRED")
+
             shipment_summary = {
                 "total_items": total_items,
                 "total_volume_m3": total_volume_m3,
                 "total_floor_area_m2": total_floor_area_m2,
                 "total_weight_kg": total_weight_kg,
+                "reliability_breakdown": {
+                    "reliable_items_count": reliable_count,
+                    "review_required_items_count": review_count,
+                    "review_required_categories": review_required_items,
+                },
                 "item_breakdown": [
                     {
                         "category": item["category"],
                         "quantity": item["quantity"],
+                        "confidence": item["confidence"],
+                        "reliability": item["reliability"],
+                        "is_dispatch_ready": item["is_dispatch_ready"],
                         "unit_volume_m3": item["cargo_summary"]["unit_volume_m3"],
                         "total_volume_m3": item["cargo_summary"]["total_volume_m3"],
                         "unit_weight_kg": item["cargo_summary"]["unit_weight_kg"],
@@ -1025,11 +1070,16 @@ class CargoAnalysisPipeline:
                 deduped_warnings.append(w)
 
         # Final Result Schema
+        rel_status = classification_res.get(
+            "reliability",
+            "RELIABLE" if classification_res.get("confidence", 0.0) >= RELIABLE_CONFIDENCE_THRESHOLD else "REVIEW_REQUIRED"
+        )
         return {
             "status": "SUCCESS",
             "mode": "SINGLE_LOAD",
             "input_image": os.path.abspath(image_path),
             "classification": classification_res,
+            "reliability": rel_status,
             "dimensions": dimensions_dict,
             "quantity": quantity,
             "cargo_summary": cargo_summary,
@@ -1079,6 +1129,7 @@ class CargoAnalysisPipeline:
                 "input_image": single_res["input_image"],
                 "category": single_res["classification"]["class_name"],
                 "classification": single_res["classification"],
+                "reliability": single_res.get("reliability", single_res["classification"].get("reliability", "RELIABLE")),
                 "quantity": qty,
                 "dimensions": single_res["dimensions"],
                 "cargo_summary": single_res["cargo_summary"],
@@ -1270,10 +1321,12 @@ def main():
             dims = item["dimensions"]
             c_sum = item["cargo_summary"]
             conf = item["confidence"]
+            rel = item.get("reliability", "RELIABLE")
+            rel_tag = f" [{rel}]" if rel == "REVIEW_REQUIRED" else ""
             dim_str = f"{dims['length_cm']} x {dims['width_cm']} x {dims['height_cm']} cm" if dims.get('length_cm') else "Unmeasured"
             vol_str = f"{c_sum['total_volume_m3']:.4f} m³" if c_sum.get('total_volume_m3') else "N/A"
             wt_str = f"{c_sum['total_weight_kg']:.1f} kg" if c_sum.get('total_weight_kg') is not None else "N/A"
-            print(f"{idx+1:>2}. {cat:<16} x{qty:<3} (Conf: {conf:.1%}, Unit: {dim_str}, Vol: {vol_str}, Wt: {wt_str})")
+            print(f"{idx+1:>2}. {cat:<16} x{qty:<3} (Conf: {conf:.1%}{rel_tag}, Unit: {dim_str}, Vol: {vol_str}, Wt: {wt_str})")
 
         print(f"\nTOTAL ITEMS:      {result['total_items']}")
         print(f"TOTAL VOLUME:     {summary['total_volume_m3']:.4f} m³" if summary.get('total_volume_m3') else "TOTAL VOLUME:     N/A")
@@ -1303,12 +1356,14 @@ def main():
     dim_info = result["dimensions"]
     summary = result["cargo_summary"]
     rec = result["vehicle_recommendation"]
+    rel_status = result.get("reliability", cls_info.get("reliability", "RELIABLE"))
+    rel_tag = f" [{rel_status}]" if rel_status == "REVIEW_REQUIRED" else ""
 
     print("\n" + "=" * 78)
     print("CARGO VISION LOGISTICS DISPATCH REPORT")
     print("=" * 78)
     print(f"Input Image:           {result['input_image']}")
-    print(f"Detected Cargo:        {cls_info['class_name'].upper()} (Confidence: {cls_info['confidence']:.1%})")
+    print(f"Detected Cargo:        {cls_info['class_name'].upper()} (Confidence: {cls_info['confidence']:.1%}{rel_tag})")
     if "bounding_box_px" in cls_info:
         print(f"Bounding Box:          {cls_info['bounding_box_px']} px")
     print(f"Quantity:              {result['quantity']} item(s)")
@@ -1343,6 +1398,7 @@ def main():
         w_text = textwrap.fill(f"* {w}", width=76, initial_indent="  ", subsequent_indent="    ")
         print(w_text)
     print("=" * 78)
+
 
 
 if __name__ == "__main__":
