@@ -295,6 +295,7 @@ class CargoAnalysisPipeline:
         self,
         model_path: str = "models/cargo_mobilenetv2_expanded_best.keras",
         yolo_model_path: str = "yolov8n.pt",
+        custom_yolo_model_path: Optional[str] = "models/cargo_yolo_exp_v2_best.pt",
         custom_vehicle_db: Optional[VehicleDatabase] = None,
         custom_dimension_estimator: Optional[DimensionEstimator] = None,
         detector_backend: str = "auto",
@@ -302,12 +303,14 @@ class CargoAnalysisPipeline:
     ):
         self.model_path = model_path
         self.yolo_model_path = yolo_model_path
+        self.custom_yolo_model_path = custom_yolo_model_path
         self.vehicle_db = custom_vehicle_db if custom_vehicle_db is not None else vehicle_db
         self.dimension_estimator = custom_dimension_estimator if custom_dimension_estimator is not None else DimensionEstimator()
         self.detector_backend = detector_backend
         self.conf_threshold = conf_threshold
-        self._model = None       # Lazy-loaded MobileNetV2
-        self._yolo_model = None  # Lazy-loaded YOLO
+        self._model = None              # Lazy-loaded MobileNetV2
+        self._yolo_model = None         # Lazy-loaded YOLO (COCO)
+        self._custom_yolo_model = None  # Lazy-loaded Custom Cargo YOLO
 
     def _get_model(self):
         """Lazy loads TensorFlow MobileNetV2 model to optimize startup time."""
@@ -324,6 +327,20 @@ class CargoAnalysisPipeline:
             from ultralytics import YOLO
             self._yolo_model = YOLO(self.yolo_model_path)
         return self._yolo_model
+
+    def _get_custom_yolo_model(self):
+        """Lazy loads custom trained cargo YOLO model if available."""
+        if self._custom_yolo_model is None and self.custom_yolo_model_path is not None:
+            if os.path.exists(self.custom_yolo_model_path):
+                from ultralytics import YOLO
+                self._custom_yolo_model = YOLO(self.custom_yolo_model_path)
+            else:
+                for fallback_p in ["models/cargo_yolo_exp_v2_best.pt", "models/cargo_yolo_24class_best.pt", "models/cargo_yolo_improved_best.pt"]:
+                    if os.path.exists(fallback_p):
+                        from ultralytics import YOLO
+                        self._custom_yolo_model = YOLO(fallback_p)
+                        break
+        return self._custom_yolo_model
 
     def validate_image_input(self, image_path: str) -> Tuple[bool, Optional[str], Optional[Image.Image]]:
         """
@@ -348,57 +365,103 @@ class CargoAnalysisPipeline:
         image_input: Union[str, Image.Image],
     ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
         """
-        Executes object detection using YOLOv8 COCO model.
+        Executes object detection using specialized custom cargo YOLO model and/or base COCO model.
         Returns detection summary dictionary and warnings, or None if no valid objects found.
-        Filters out unsupported / non-cargo COCO classes.
+        Filters out unsupported / non-cargo categories.
         """
         warnings = []
         try:
-            model = self._get_yolo_model()
-            results = model.predict(source=image_input, conf=self.conf_threshold, verbose=False)[0]
-            boxes = results.boxes
+            raw_detections = []
 
-            if boxes is None or len(boxes) == 0:
+            # 1. Custom Cargo YOLO model (specialized for Box and custom cargo categories)
+            custom_m = self._get_custom_yolo_model()
+            if custom_m is not None:
+                try:
+                    c_results = custom_m.predict(source=image_input, conf=self.conf_threshold, verbose=False)[0]
+                    if c_results.boxes is not None and len(c_results.boxes) > 0:
+                        for i in range(len(c_results.boxes)):
+                            cls_id = int(c_results.boxes.cls[i].item())
+                            raw_cls_name = custom_m.names.get(cls_id, f"class_{cls_id}").lower()
+                            c_score = float(c_results.boxes.conf[i].item())
+                            xyxy = c_results.boxes.xyxy[i].tolist()
+                            if raw_cls_name in COCO_TO_CARGO_MAP:
+                                canonical_class = COCO_TO_CARGO_MAP[raw_cls_name]
+                                raw_detections.append({
+                                    "raw_class": raw_cls_name,
+                                    "canonical_class": canonical_class,
+                                    "confidence": round(c_score, 4),
+                                    "bbox_px": [round(x, 1) for x in xyxy],
+                                    "backend": "yolo_cargo_custom",
+                                })
+                except Exception as e:
+                    warnings.append(f"Custom YOLO inference note: {str(e)}")
+
+            # 2. Base COCO YOLO model (provides reliable vehicle/car, refrigerator, etc. detections)
+            coco_m = self._get_yolo_model()
+            if coco_m is not None:
+                try:
+                    coco_results = coco_m.predict(source=image_input, conf=self.conf_threshold, verbose=False)[0]
+                    if coco_results.boxes is not None and len(coco_results.boxes) > 0:
+                        for i in range(len(coco_results.boxes)):
+                            cls_id = int(coco_results.boxes.cls[i].item())
+                            raw_cls_name = coco_m.names.get(cls_id, f"class_{cls_id}").lower()
+                            c_score = float(coco_results.boxes.conf[i].item())
+                            xyxy = coco_results.boxes.xyxy[i].tolist()
+                            if raw_cls_name in COCO_TO_CARGO_MAP:
+                                canonical_class = COCO_TO_CARGO_MAP[raw_cls_name]
+                                raw_detections.append({
+                                    "raw_class": raw_cls_name,
+                                    "canonical_class": canonical_class,
+                                    "confidence": round(c_score, 4),
+                                    "bbox_px": [round(x, 1) for x in xyxy],
+                                    "backend": "yolo_coco",
+                                })
+                except Exception as e:
+                    warnings.append(f"COCO YOLO inference note: {str(e)}")
+
+            if not raw_detections:
                 return None, ["No objects detected by YOLO detector above confidence threshold."]
 
-            detected_items = []
-            for i in range(len(boxes)):
-                cls_id = int(boxes.cls[i].item())
-                raw_cls_name = model.names.get(cls_id, f"class_{cls_id}").lower()
-                c_score = float(boxes.conf[i].item())
-                xyxy = boxes.xyxy[i].tolist()
+            # Sort candidate detections by descending confidence
+            raw_detections.sort(key=lambda d: d["confidence"], reverse=True)
 
-                # Safely filter out unsupported non-cargo categories
-                if raw_cls_name not in COCO_TO_CARGO_MAP:
-                    continue
+            # Apply Non-Maximum Suppression (IoU overlap deduplication)
+            filtered_detections = []
+            for d in raw_detections:
+                box_a = d["bbox_px"]
+                is_duplicate = False
+                for existing in filtered_detections:
+                    box_b = existing["bbox_px"]
+                    xA = max(box_a[0], box_b[0])
+                    yA = max(box_a[1], box_b[1])
+                    xB = min(box_a[2], box_b[2])
+                    yB = min(box_a[3], box_b[3])
+                    interArea = max(0.0, xB - xA) * max(0.0, yB - yA)
+                    boxAArea = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+                    boxBArea = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+                    denom = boxAArea + boxBArea - interArea
+                    iou = interArea / float(denom) if denom > 0 else 0.0
 
-                canonical_class = COCO_TO_CARGO_MAP[raw_cls_name]
+                    if iou > 0.45:
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    filtered_detections.append(d)
 
-                detected_items.append({
-                    "raw_class": raw_cls_name,
-                    "canonical_class": canonical_class,
-                    "confidence": round(c_score, 4),
-                    "bbox_px": [round(x, 1) for x in xyxy],
-                })
-
-            if not detected_items:
+            if not filtered_detections:
                 return None, ["No supported cargo objects found in YOLO detections."]
 
-            # Prioritize highest confidence detection
-            detected_items.sort(key=lambda d: d["confidence"], reverse=True)
-            primary = detected_items[0]
-
-            # Count instances matching primary class
-            primary_instances = [d for d in detected_items if d["canonical_class"] == primary["canonical_class"]]
+            primary = filtered_detections[0]
+            primary_instances = [d for d in filtered_detections if d["canonical_class"] == primary["canonical_class"]]
 
             detection_res = {
                 "class_name": primary["canonical_class"],
                 "confidence": primary["confidence"],
                 "raw_class_name": primary["raw_class"],
-                "detector_backend": "yolo_coco",
+                "detector_backend": primary.get("backend", "yolo"),
                 "bounding_box_px": primary["bbox_px"],
                 "detected_instance_count": len(primary_instances),
-                "all_detections": detected_items,
+                "all_detections": filtered_detections,
                 "probabilities": {primary["canonical_class"]: primary["confidence"]},
             }
 
