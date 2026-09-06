@@ -623,6 +623,128 @@ class TestCargoAnalysisPipeline(unittest.TestCase):
         self.assertEqual(rec["vehicle_id"], "V_CAR_CARRIER_MULTI")
         self.assertIn("Accommodates combined shipment (3 items:", rec["reason"])
 
+    # -------------------------------------------------------------------------
+    # 34. Individual 3D Dimension Fit: Cargo Too Long Eliminates Vehicle
+    # -------------------------------------------------------------------------
+    def test_cargo_too_long_eliminates_vehicle_despite_volume_and_payload(self):
+        """Verify cargo item with length exceeding vehicle length is rejected even if volume and payload fit."""
+        # Long cargo: 280 x 40 x 40 cm, 50 kg. Volume = 0.448 / 0.80 = 0.56 m3, floor area = 1.12 m2, payload = 50 kg.
+        # Bolero Pickup (length 250 cm, max dim 250 cm, vol 7.43 m3, bed 4.25 m2, payload 1500 kg)
+        # 280 cm exceeds Bolero's 250 cm length -> Bolero must be eliminated!
+        # Tata 407 (length 420 cm, vol 17.64 m3, payload 3500 kg) accommodates it.
+        cargo_dims = {"length_cm": 280.0, "width_cm": 40.0, "height_cm": 40.0, "weight_kg": 50.0}
+        cargo_sum, _ = self.pipeline.calculate_cargo_requirements(cargo_dims, "box", quantity=1)
+
+        rec, _ = self.pipeline.recommend_vehicle(
+            category="box",
+            dimensions=cargo_dims,
+            cargo_summary=cargo_sum,
+            quantity=1,
+        )
+        self.assertNotIn(rec["vehicle_id"], ["V_3W_AUTO", "V_TATA_ACE", "V_BOLERO_PICKUP"])
+        self.assertEqual(rec["vehicle_id"], "V_TATA_407_14FT")
+
+    # -------------------------------------------------------------------------
+    # 35. Individual 3D Dimension Fit: Cargo Too Wide Eliminates Vehicle
+    # -------------------------------------------------------------------------
+    def test_cargo_too_wide_eliminates_vehicle(self):
+        """Verify cargo item whose width exceeds vehicle usable width is rejected."""
+        # Bed frame: 200 x 160 x 60 cm, 50 kg.
+        # Tata Ace has usable width 145 cm < 160 cm, usable length 220 cm.
+        # Lying upright: width 160 > 145; Yaw-rotated: length 200 > 145.
+        # Tata Ace must be eliminated due to width constraints!
+        # Bolero Pickup (usable width 170 cm, length 250 cm) accommodates it.
+        bed_dims = {"length_cm": 200.0, "width_cm": 160.0, "height_cm": 60.0, "weight_kg": 50.0}
+        cargo_sum, _ = self.pipeline.calculate_cargo_requirements(bed_dims, "bed", quantity=1)
+
+        rec, _ = self.pipeline.recommend_vehicle(
+            category="bed",
+            dimensions=bed_dims,
+            cargo_summary=cargo_sum,
+            quantity=1,
+        )
+        self.assertNotIn(rec["vehicle_id"], ["V_3W_AUTO", "V_TATA_ACE"])
+        self.assertEqual(rec["vehicle_id"], "V_BOLERO_PICKUP")
+
+    # -------------------------------------------------------------------------
+    # 36. Individual 3D Dimension Fit: Cargo Too Tall Eliminates Vehicle
+    # -------------------------------------------------------------------------
+    def test_cargo_too_tall_eliminates_vehicle(self):
+        """Verify upright cargo item whose height exceeds vehicle usable height is rejected."""
+        # Tall wardrobe/refrigerator: 80 x 80 x 190 cm, 75 kg.
+        # Tata Ace height is 150 cm < 190 cm -> eliminated.
+        # Bolero Pickup height is 175 cm < 190 cm -> eliminated.
+        # Tata 407 (usable height 210 cm) accommodates it.
+        tall_dims = {"length_cm": 80.0, "width_cm": 80.0, "height_cm": 190.0, "weight_kg": 75.0}
+        cargo_sum, _ = self.pipeline.calculate_cargo_requirements(tall_dims, "refrigerator", quantity=1)
+
+        rec, _ = self.pipeline.recommend_vehicle(
+            category="refrigerator",
+            dimensions=tall_dims,
+            cargo_summary=cargo_sum,
+            quantity=1,
+        )
+        self.assertNotIn(rec["vehicle_id"], ["V_3W_AUTO", "V_TATA_ACE", "V_BOLERO_PICKUP"])
+        self.assertEqual(rec["vehicle_id"], "V_TATA_407_14FT")
+
+    # -------------------------------------------------------------------------
+    # 37. Individual 3D Dimension Fit: Rotation Allows Fit
+    # -------------------------------------------------------------------------
+    def test_rotation_allows_fit_when_original_orientation_exceeds(self):
+        """Verify cargo item fits when rotated even though original width exceeds vehicle width."""
+        # Item: length 120 cm, width 180 cm, height 70 cm, 30 kg.
+        # Tata Ace: length 220 cm, width 145 cm, height 150 cm.
+        # Original orientation: width 180 > 145 (fails).
+        # Rotated orientation: length 180 <= 220, width 120 <= 145, height 70 <= 150 (FITS).
+        dims = {"length_cm": 120.0, "width_cm": 180.0, "height_cm": 70.0, "weight_kg": 30.0}
+
+        # Test helper directly:
+        tata_ace = self.pipeline.vehicle_db.get_vehicle_by_id("V_TATA_ACE")
+        fits_with_rot = self.pipeline._dimensions_fit_vehicle(dims, tata_ace, allow_rotation=True)
+        fits_without_rot = self.pipeline._dimensions_fit_vehicle(dims, tata_ace, allow_rotation=False)
+        self.assertTrue(fits_with_rot)
+        self.assertFalse(fits_without_rot)
+
+        # Test end-to-end recommendation:
+        cargo_sum, _ = self.pipeline.calculate_cargo_requirements(dims, "couch", quantity=1)
+        rec, _ = self.pipeline.recommend_vehicle(
+            category="couch",
+            dimensions=dims,
+            cargo_summary=cargo_sum,
+            quantity=1,
+        )
+        self.assertEqual(rec["vehicle_id"], "V_TATA_ACE")
+
+    # -------------------------------------------------------------------------
+    # 38. Multi-Load: Individual Dimensional Violation Rejects Candidate Vehicle
+    # -------------------------------------------------------------------------
+    def test_multiload_individual_dimensional_violation_rejects_vehicle(self):
+        """Verify multi-load shipment rejects vehicle when aggregate metrics fit but one item's dimensions exceed."""
+        # 4 boxes (45 x 35 x 30 cm, 12 kg each) + 1 long beam (300 x 20 x 20 cm, 20 kg).
+        # Total volume: 4 * 0.04725 / 0.80 + 0.12 / 0.80 = 0.236 + 0.15 = 0.386 m3.
+        # Total floor area: 4 * 0.1575 / 4 + 0.06 = 0.1575 + 0.06 = 0.2175 m2.
+        # Total weight: 48 + 20 = 68 kg.
+        # Tata Ace (vol 4.78 m3, bed 3.19 m2, payload 850 kg) has plenty of volume/payload,
+        # but usable length is 220 cm < 300 cm -> Tata Ace MUST be rejected!
+        # Bolero Pickup (length 250 cm) < 300 cm -> MUST be rejected!
+        # Tata 407 (length 420 cm) -> ACCEPTED!
+        box_dims = {"length_cm": 45.0, "width_cm": 35.0, "height_cm": 30.0, "weight_kg": 12.0}
+        beam_dims = {"length_cm": 300.0, "width_cm": 20.0, "height_cm": 20.0, "weight_kg": 20.0}
+
+        items = [
+            {"category": "box", "quantity": 4, "dimensions": box_dims},
+            {"category": "box", "quantity": 1, "dimensions": beam_dims},
+        ]
+
+        rec, _ = self.pipeline.recommend_vehicle_for_shipment(
+            items=items,
+            total_volume_m3=0.386,
+            total_floor_area_m2=0.2175,
+            total_weight_kg=68.0,
+        )
+        self.assertNotIn(rec["vehicle_id"], ["V_3W_AUTO", "V_TATA_ACE", "V_BOLERO_PICKUP"])
+        self.assertEqual(rec["vehicle_id"], "V_TATA_407_14FT")
+
 
 if __name__ == "__main__":
     unittest.main()

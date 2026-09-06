@@ -24,6 +24,7 @@ import json
 import math
 import argparse
 import textwrap
+import itertools
 from typing import Dict, List, Tuple, Optional, Any, Union
 import numpy as np
 from PIL import Image
@@ -43,6 +44,18 @@ from scripts.dimension_estimator import DimensionEstimator, DimensionEstimateRes
 # -----------------------------------------------------------------------------
 
 TARGET_CLASSES: List[str] = ["box", "chair", "couch", "suitcase", "table"]
+
+# Categories requiring vertical/upright transport orientation
+UPRIGHT_CARGO_CATEGORIES: set = {
+    "refrigerator",
+    "tv",
+    "car",
+    "chair",
+    "table",
+    "couch",
+    "bed",
+    "desk",
+}
 
 # Stacking limit (max layers) per category
 CATEGORY_STACKING_LIMITS: Dict[str, int] = {
@@ -92,6 +105,134 @@ COCO_TO_CARGO_MAP: Dict[str, str] = {
 
 
 # -----------------------------------------------------------------------------
+# 3D Cargo Dimension & Physical Fit Helpers
+# -----------------------------------------------------------------------------
+
+def _dimensions_fit_vehicle(
+    cargo_dimensions: Union[Dict[str, Optional[float]], Tuple[Optional[float], ...], List[Optional[float]]],
+    vehicle_dimensions: Any,
+    allow_rotation: bool = True,
+    allow_3d_rotation: Optional[bool] = None,
+    category: Optional[str] = None,
+) -> bool:
+    """
+    Validates whether individual 3D cargo physical dimensions fit inside a vehicle's usable cargo hold.
+
+    Args:
+        cargo_dimensions: Dict with 'length_cm', 'width_cm', 'height_cm' (or tuple/list of dimensions in cm).
+        vehicle_dimensions: VehicleSpec instance or dict/tuple with usable dimensions in cm.
+        allow_rotation: If True, allows valid physical re-orientation of cargo inside the vehicle.
+        allow_3d_rotation: If True, allows all 6 3D permutations (pitch/roll/yaw).
+                           If False, allows only 2D yaw rotation (L <-> W) on vehicle bed.
+                           If None (default), automatically determined by category (upright vs unconstrained).
+        category: Optional cargo category name to check upright constraints.
+
+    Returns:
+        bool: True if cargo fits within vehicle dimensions in at least one valid orientation; False otherwise.
+    """
+    # 1. Extract cargo dimensions
+    if isinstance(cargo_dimensions, dict):
+        l = cargo_dimensions.get("length_cm")
+        w = cargo_dimensions.get("width_cm")
+        h = cargo_dimensions.get("height_cm")
+    elif isinstance(cargo_dimensions, (list, tuple)):
+        l = cargo_dimensions[0] if len(cargo_dimensions) > 0 else None
+        w = cargo_dimensions[1] if len(cargo_dimensions) > 1 else None
+        h = cargo_dimensions[2] if len(cargo_dimensions) > 2 else None
+    else:
+        return True
+
+    # 2. Extract vehicle usable dimensions
+    if hasattr(vehicle_dimensions, "usable_length_cm"):
+        vl = float(vehicle_dimensions.usable_length_cm)
+        vw = float(vehicle_dimensions.usable_width_cm)
+        vh = float(vehicle_dimensions.usable_height_cm)
+    elif isinstance(vehicle_dimensions, dict):
+        vl = float(vehicle_dimensions.get("usable_length_cm") or vehicle_dimensions.get("length_cm", 0.0))
+        vw = float(vehicle_dimensions.get("usable_width_cm") or vehicle_dimensions.get("width_cm", 0.0))
+        vh = float(vehicle_dimensions.get("usable_height_cm") or vehicle_dimensions.get("height_cm", 0.0))
+    elif isinstance(vehicle_dimensions, (list, tuple)) and len(vehicle_dimensions) >= 3:
+        vl = float(vehicle_dimensions[0])
+        vw = float(vehicle_dimensions[1])
+        vh = float(vehicle_dimensions[2])
+    else:
+        return True
+
+    if vl <= 0 or vw <= 0 or vh <= 0:
+        return False
+
+    # 3. No dimensions provided to constrain
+    if l is None and w is None and h is None:
+        return True
+
+    # 4. Strict exact orientation check (no rotation)
+    if not allow_rotation:
+        if l is not None and l > vl:
+            return False
+        if w is not None and w > vw:
+            return False
+        if h is not None and h > vh:
+            return False
+        return True
+
+    # 5. Rotation is allowed
+    is_upright = False
+    if category is not None and category.lower() in UPRIGHT_CARGO_CATEGORIES:
+        is_upright = True
+
+    if allow_3d_rotation is True:
+        can_3d_rotate = True
+    elif allow_3d_rotation is False:
+        can_3d_rotate = False
+    else:
+        can_3d_rotate = not is_upright
+
+    # Case A: All 3 dimensions are present
+    if l is not None and w is not None and h is not None:
+        if can_3d_rotate:
+            for (cl, cw, ch) in itertools.permutations([l, w, h]):
+                if cl <= vl and cw <= vw and ch <= vh:
+                    return True
+            return False
+        else:
+            # Upright / 2D yaw rotation on bed (H <= vh, and L/W can swap on bed)
+            if h > vh:
+                return False
+            if (l <= vl and w <= vw) or (w <= vl and l <= vw):
+                return True
+            return False
+
+    # Case B: Partial dimensions
+    known_dims = [d for d in [l, w, h] if d is not None]
+    if len(known_dims) == 1:
+        d = known_dims[0]
+        if can_3d_rotate:
+            return d <= max(vl, vw, vh)
+        else:
+            if h is not None:
+                return h <= vh
+            return d <= max(vl, vw)
+    elif len(known_dims) == 2:
+        d1, d2 = known_dims
+        if can_3d_rotate:
+            v_dims = [vl, vw, vh]
+            for i in range(3):
+                for j in range(3):
+                    if i != j and d1 <= v_dims[i] and d2 <= v_dims[j]:
+                        return True
+            return False
+        else:
+            if h is not None:
+                other = d1 if h == d2 else d2
+                if h > vh:
+                    return False
+                return other <= max(vl, vw)
+            return (d1 <= vl and d2 <= vw) or (d2 <= vl and d1 <= vw)
+
+    return True
+
+
+# -----------------------------------------------------------------------------
 # Unified Pipeline Class
 # -----------------------------------------------------------------------------
 
@@ -105,6 +246,8 @@ class CargoAnalysisPipeline:
       - Multi-Constraint Vehicle Selection (Dimensions, Volume, Floor Area, Payload Capacity)
       - Dual vision backends (YOLOv8 COCO detector & MobileNetV2 classification fallback)
     """
+
+    _dimensions_fit_vehicle = staticmethod(_dimensions_fit_vehicle)
 
     def __init__(
         self,
@@ -352,12 +495,8 @@ class CargoAnalysisPipeline:
         suitable_vehicles: List[VehicleSpec] = []
 
         for v in all_vehicles:
-            # Constraint 1: Single item physical dimension fit
-            if length is not None and length > v.usable_length_cm:
-                continue
-            if width is not None and width > v.usable_width_cm:
-                continue
-            if height is not None and height > v.usable_height_cm:
+            # Constraint 1: Single item physical dimension fit (with valid rotation support)
+            if not _dimensions_fit_vehicle(dimensions, v, allow_rotation=True, category=category):
                 continue
 
             # Constraint 2: Total required volume fit
@@ -378,6 +517,8 @@ class CargoAnalysisPipeline:
             # Fallback: cargo exceeds single standard vehicle capacity
             largest_v = all_vehicles[-1]
             exceeded_reasons = []
+            if not _dimensions_fit_vehicle(dimensions, largest_v, allow_rotation=True, category=category):
+                exceeded_reasons.append("physical dimensions")
             if total_vol is not None and total_vol > largest_v.usable_volume_m3:
                 exceeded_reasons.append("volume")
             if req_floor_area is not None and req_floor_area > largest_v.floor_area_m2:
@@ -430,7 +571,7 @@ class CargoAnalysisPipeline:
     ) -> Tuple[Dict[str, Any], List[str]]:
         """
         Matches multi-item combined cargo shipment requirements against the Vehicle Database:
-          1. Individual dimension fit (length, width, height)
+          1. Individual dimension fit (length, width, height with valid rotation)
           2. Total usable volume fit
           3. Total floor bed area fit
           4. Total payload weight fit
@@ -457,20 +598,12 @@ class CargoAnalysisPipeline:
         suitable_vehicles: List[VehicleSpec] = []
 
         for v in all_vehicles:
-            # Constraint 1: Every individual item's dimensions must fit inside vehicle
+            # Constraint 1: Every individual item's dimensions must fit inside vehicle (with valid rotation)
             fits_dimensions = True
             for item in items:
                 dims = item.get("dimensions", {})
-                l = dims.get("length_cm")
-                w = dims.get("width_cm")
-                h = dims.get("height_cm")
-                if l is not None and l > v.usable_length_cm:
-                    fits_dimensions = False
-                    break
-                if w is not None and w > v.usable_width_cm:
-                    fits_dimensions = False
-                    break
-                if h is not None and h > v.usable_height_cm:
+                cat = item.get("category")
+                if not _dimensions_fit_vehicle(dims, v, allow_rotation=True, category=cat):
                     fits_dimensions = False
                     break
             if not fits_dimensions:
@@ -496,6 +629,12 @@ class CargoAnalysisPipeline:
         if not suitable_vehicles:
             largest_v = all_vehicles[-1]
             exceeded_reasons = []
+            dim_exceeded = any(
+                not _dimensions_fit_vehicle(item.get("dimensions", {}), largest_v, allow_rotation=True, category=item.get("category"))
+                for item in items
+            )
+            if dim_exceeded:
+                exceeded_reasons.append("individual item dimensions")
             if total_volume_m3 is not None and total_volume_m3 > largest_v.usable_volume_m3:
                 exceeded_reasons.append("volume")
             if total_floor_area_m2 is not None and total_floor_area_m2 > largest_v.floor_area_m2:
