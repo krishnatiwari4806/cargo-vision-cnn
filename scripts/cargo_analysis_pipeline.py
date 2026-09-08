@@ -36,7 +36,15 @@ if PROJECT_ROOT not in sys.path:
 
 # Import existing core modules
 from scripts.vehicle_database import VehicleDatabase, VehicleSpec, vehicle_db
-from scripts.dimension_estimator import DimensionEstimator, DimensionEstimateResult, EstimationStatus
+from scripts.dimension_estimator import (
+    DimensionEstimator,
+    DimensionEstimateResult,
+    EstimationStatus,
+    WeightSource,
+    WeightStatus,
+    WeightEstimateResult,
+    resolve_weight,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -534,17 +542,39 @@ class CargoAnalysisPipeline:
         category: str,
         quantity: int,
         unit_weight_kg: Optional[float] = None,
+        user_weight_kg: Optional[float] = None,
+        measured_scale_weight_kg: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         """
         Calculates unit volume, required total volume, stacking floor area, and payload weight.
+        Integrates multi-tier weight resolution (Scale > User > Density > Prior).
         """
         warnings = []
         length = dimensions.get("length_cm")
         width = dimensions.get("width_cm")
         height = dimensions.get("height_cm")
 
-        # Resolve weight from argument, dimensions dict, or category prior
-        if unit_weight_kg is None:
+        # Resolve weight metadata from dimensions or explicitly provided overrides
+        w_src = dimensions.get("weight_source")
+        w_stat = dimensions.get("weight_status")
+        w_conf = dimensions.get("weight_confidence")
+        w_unc_kg = dimensions.get("weight_uncertainty_kg")
+        w_unc_pct = dimensions.get("weight_uncertainty_percent")
+
+        if user_weight_kg is not None or measured_scale_weight_kg is not None or unit_weight_kg is None or w_src is None:
+            w_res = resolve_weight(
+                category=category,
+                measured_scale_weight_kg=measured_scale_weight_kg,
+                user_weight_kg=user_weight_kg if user_weight_kg is not None else unit_weight_kg,
+            )
+            unit_weight_kg = w_res.weight_kg
+            w_src = w_res.weight_source
+            w_stat = w_res.weight_status
+            w_conf = w_res.weight_confidence
+            w_unc_kg = w_res.weight_uncertainty_kg
+            w_unc_pct = w_res.weight_uncertainty_percent
+            warnings.extend(w_res.warnings)
+        elif unit_weight_kg is None:
             unit_weight_kg = dimensions.get("weight_kg")
 
         stacking_limit = CATEGORY_STACKING_LIMITS.get(category.lower(), 1)
@@ -580,6 +610,11 @@ class CargoAnalysisPipeline:
             "total_volume_m3": total_vol_m3,
             "unit_weight_kg": unit_weight_kg,
             "total_weight_kg": total_weight_kg,
+            "weight_source": w_src,
+            "weight_status": w_stat,
+            "weight_confidence": w_conf,
+            "weight_uncertainty_kg": round(w_unc_kg * quantity, 2) if w_unc_kg is not None else None,
+            "weight_uncertainty_percent": w_unc_pct,
             "stacking_limit_layers": stacking_limit,
             "required_floor_area_m2": req_floor_area_m2,
         }
@@ -602,10 +637,20 @@ class CargoAnalysisPipeline:
         """
         warnings = []
         total_weight_kg = cargo_summary.get("total_weight_kg")
+        w_src = cargo_summary.get("weight_source", "category_prior")
         if total_weight_kg is not None:
-            warnings.append(
-                f"Payload suitability cannot be verified against a physical scale; weight ({total_weight_kg:.1f} kg) is estimated from standard category priors."
-            )
+            if w_src == "scale_measured":
+                warnings.append(
+                    f"Payload verified from external physical scale measurement ({total_weight_kg:.1f} kg)."
+                )
+            elif w_src == "user_provided":
+                warnings.append(
+                    f"Payload calculated from user/manifest declared weight ({total_weight_kg:.1f} kg)."
+                )
+            else:
+                warnings.append(
+                    f"Payload suitability cannot be verified against a physical scale; weight ({total_weight_kg:.1f} kg) is estimated from standard category priors."
+                )
         else:
             warnings.append(
                 "Payload suitability cannot be verified because physical object weight is unavailable."
@@ -673,6 +718,13 @@ class CargoAnalysisPipeline:
         primary_v = suitable_vehicles[0]
         alternatives = [v.vehicle_name for v in suitable_vehicles[1:3]]
 
+        # Conservative 80% payload threshold warning when relying on unverified priors
+        if total_weight_kg is not None and w_src in ("category_prior", "density_estimate"):
+            if total_weight_kg >= 0.80 * primary_v.max_payload_kg:
+                warnings.append(
+                    f"Estimated payload ({total_weight_kg:.1f} kg) exceeds 80% of {primary_v.vehicle_name} capacity ({primary_v.max_payload_kg:.1f} kg) under category-prior uncertainty (±40%). Scale verification is recommended before fleet dispatch."
+                )
+
         # Construct clear reasoning
         reason_parts = [f"Accommodates {quantity} {category}(s)"]
         if total_vol is not None:
@@ -708,10 +760,21 @@ class CargoAnalysisPipeline:
           4. Total payload weight fit
         """
         warnings = []
+        has_prior_weights = False
         if total_weight_kg is not None:
-            warnings.append(
-                f"Payload suitability cannot be verified against a physical scale; total shipment weight ({total_weight_kg:.1f} kg) is estimated from category priors."
+            has_prior_weights = any(
+                item.get("cargo_summary", {}).get("weight_source") in ("category_prior", "density_estimate")
+                or item.get("dimensions", {}).get("weight_source") in ("category_prior", "density_estimate")
+                for item in items
             )
+            if has_prior_weights:
+                warnings.append(
+                    f"Payload suitability cannot be verified against a physical scale; total shipment weight ({total_weight_kg:.1f} kg) is estimated from category priors."
+                )
+            else:
+                warnings.append(
+                    f"Total shipment payload ({total_weight_kg:.1f} kg) verified from user/scale declared weights."
+                )
         else:
             warnings.append(
                 "Payload suitability cannot be verified because physical object weight is unavailable."
@@ -794,6 +857,13 @@ class CargoAnalysisPipeline:
         primary_v = suitable_vehicles[0]
         alternatives = [v.vehicle_name for v in suitable_vehicles[1:3]]
 
+        # Conservative 80% payload threshold warning when relying on unverified priors
+        if total_weight_kg is not None and has_prior_weights:
+            if total_weight_kg >= 0.80 * primary_v.max_payload_kg:
+                warnings.append(
+                    f"Estimated shipment payload ({total_weight_kg:.1f} kg) exceeds 80% of {primary_v.vehicle_name} capacity ({primary_v.max_payload_kg:.1f} kg) under category-prior uncertainty (±40%). Scale verification is recommended before fleet dispatch."
+                )
+
         reason_parts = [f"Accommodates combined shipment ({total_quantity} items: {category_summary_str})"]
         if total_volume_m3 is not None:
             reason_parts.append(f"requiring {total_volume_m3:.2f} m³ usable space (vehicle capacity: {primary_v.usable_volume_m3:.2f} m³)")
@@ -819,6 +889,9 @@ class CargoAnalysisPipeline:
         object_bbox_px: Optional[Tuple[int, int, int, int]] = None,
         extract_all_objects: bool = False,
         infer_aspect_depth: bool = False,
+        user_weight_kg: Optional[float] = None,
+        measured_scale_weight_kg: Optional[float] = None,
+        user_weights_kg: Optional[List[Optional[float]]] = None,
     ) -> Dict[str, Any]:
         """
         Executes end-to-end analysis on a single cargo photo.
@@ -832,6 +905,9 @@ class CargoAnalysisPipeline:
                                 and aggregates their physical requirements into a combined shipment.
             infer_aspect_depth: When True and marker is used, infers missing orthogonal depth axis
                                 from category 3D aspect-ratio prior.
+            user_weight_kg: Optional user/manifest declared unit weight in kg.
+            measured_scale_weight_kg: Optional certified external scale weight in kg.
+            user_weights_kg: Optional list of user weights corresponding to extracted object instances.
         """
         all_warnings = ["95% target has not yet been validated against a measured physical benchmark."]
 
@@ -886,12 +962,15 @@ class CargoAnalysisPipeline:
 
             multi_items = []
             review_required_items = []
-            for cat, count in category_counts.items():
+            for item_idx, (cat, count) in enumerate(category_counts.items()):
                 qty = count * (quantity if quantity > 1 else 1)
+                item_u_wt = user_weights_kg[item_idx] if (user_weights_kg and item_idx < len(user_weights_kg)) else user_weight_kg
                 dim_res = self.dimension_estimator.estimate(
                     category=cat,
                     fallback_to_prior=True,
                     infer_aspect_depth=infer_aspect_depth,
+                    user_weight_kg=item_u_wt,
+                    measured_scale_weight_kg=measured_scale_weight_kg,
                 )
                 all_warnings.extend(dim_res.warnings)
 
@@ -908,6 +987,10 @@ class CargoAnalysisPipeline:
                     "depth_estimation_method": getattr(dim_res, "depth_estimation_method", None),
                     "weight_kg": getattr(dim_res, "weight_kg", None),
                     "weight_source": getattr(dim_res, "weight_source", None),
+                    "weight_status": getattr(dim_res, "weight_status", None),
+                    "weight_confidence": getattr(dim_res, "weight_confidence", None),
+                    "weight_uncertainty_kg": getattr(dim_res, "weight_uncertainty_kg", None),
+                    "weight_uncertainty_percent": getattr(dim_res, "weight_uncertainty_percent", None),
                     "confidence": dim_res.confidence,
                 }
 
@@ -916,6 +999,8 @@ class CargoAnalysisPipeline:
                     category=cat,
                     quantity=qty,
                     unit_weight_kg=dims_dict.get("weight_kg"),
+                    user_weight_kg=item_u_wt,
+                    measured_scale_weight_kg=measured_scale_weight_kg,
                 )
                 all_warnings.extend(c_warn)
 
@@ -975,6 +1060,8 @@ class CargoAnalysisPipeline:
                         "total_volume_m3": item["cargo_summary"]["total_volume_m3"],
                         "unit_weight_kg": item["cargo_summary"]["unit_weight_kg"],
                         "total_weight_kg": item["cargo_summary"]["total_weight_kg"],
+                        "weight_source": item["cargo_summary"].get("weight_source"),
+                        "weight_status": item["cargo_summary"].get("weight_status"),
                         "required_floor_area_m2": item["cargo_summary"]["required_floor_area_m2"],
                         "dimensions_cm": {
                             "length": item["dimensions"]["length_cm"],
@@ -1044,6 +1131,8 @@ class CargoAnalysisPipeline:
             object_bbox_px=effective_bbox,
             fallback_to_prior=True,
             infer_aspect_depth=infer_aspect_depth,
+            user_weight_kg=user_weight_kg,
+            measured_scale_weight_kg=measured_scale_weight_kg,
         )
         all_warnings.extend(dim_res.warnings)
 
@@ -1060,6 +1149,10 @@ class CargoAnalysisPipeline:
             "depth_estimation_method": getattr(dim_res, "depth_estimation_method", None),
             "weight_kg": getattr(dim_res, "weight_kg", None),
             "weight_source": getattr(dim_res, "weight_source", None),
+            "weight_status": getattr(dim_res, "weight_status", None),
+            "weight_confidence": getattr(dim_res, "weight_confidence", None),
+            "weight_uncertainty_kg": getattr(dim_res, "weight_uncertainty_kg", None),
+            "weight_uncertainty_percent": getattr(dim_res, "weight_uncertainty_percent", None),
             "confidence": dim_res.confidence,
         }
 
@@ -1069,6 +1162,8 @@ class CargoAnalysisPipeline:
             category=detected_category,
             quantity=quantity,
             unit_weight_kg=dimensions_dict.get("weight_kg"),
+            user_weight_kg=user_weight_kg,
+            measured_scale_weight_kg=measured_scale_weight_kg,
         )
         all_warnings.extend(cargo_warnings)
 
@@ -1112,10 +1207,19 @@ class CargoAnalysisPipeline:
         image_paths: List[str],
         quantities: Optional[List[int]] = None,
         infer_aspect_depth: bool = False,
+        user_weights_kg: Optional[List[Optional[float]]] = None,
+        measured_scale_weights_kg: Optional[List[Optional[float]]] = None,
     ) -> Dict[str, Any]:
         """
         Executes end-to-end multi-load analysis on multiple cargo photos.
         Aggregates items into a single unified shipment dispatch recommendation.
+
+        Args:
+            image_paths: List of image file paths.
+            quantities: Optional quantities per image.
+            infer_aspect_depth: When True, infers missing depth for ArUco measured items.
+            user_weights_kg: Optional list of user-provided weights corresponding to each image.
+            measured_scale_weights_kg: Optional list of measured scale weights corresponding to each image.
         """
         if not image_paths or not isinstance(image_paths, list):
             return {
@@ -1137,7 +1241,15 @@ class CargoAnalysisPipeline:
         all_warnings = ["95% target has not yet been validated against a measured physical benchmark."]
 
         for idx, (img_path, qty) in enumerate(zip(image_paths, quantities)):
-            single_res = self.analyze(image_path=img_path, quantity=qty, infer_aspect_depth=infer_aspect_depth)
+            u_wt = user_weights_kg[idx] if (user_weights_kg and idx < len(user_weights_kg)) else None
+            s_wt = measured_scale_weights_kg[idx] if (measured_scale_weights_kg and idx < len(measured_scale_weights_kg)) else None
+            single_res = self.analyze(
+                image_path=img_path,
+                quantity=qty,
+                infer_aspect_depth=infer_aspect_depth,
+                user_weight_kg=u_wt,
+                measured_scale_weight_kg=s_wt,
+            )
             if single_res.get("status") == "ERROR":
                 return {
                     "status": "ERROR",
@@ -1180,6 +1292,8 @@ class CargoAnalysisPipeline:
                     "total_volume_m3": item["cargo_summary"]["total_volume_m3"],
                     "unit_weight_kg": item["cargo_summary"]["unit_weight_kg"],
                     "total_weight_kg": item["cargo_summary"]["total_weight_kg"],
+                    "weight_source": item["cargo_summary"].get("weight_source"),
+                    "weight_status": item["cargo_summary"].get("weight_status"),
                     "required_floor_area_m2": item["cargo_summary"]["required_floor_area_m2"],
                     "dimensions_cm": {
                         "length": item["dimensions"]["length_cm"],
@@ -1219,6 +1333,7 @@ class CargoAnalysisPipeline:
         }
 
 
+
 # -----------------------------------------------------------------------------
 # CLI Entrypoint
 # -----------------------------------------------------------------------------
@@ -1237,6 +1352,12 @@ def main():
                         help="Optional object bounding box in pixels (xmin ymin xmax ymax).")
     parser.add_argument("--infer-aspect-depth", action="store_true",
                         help="Infer missing orthogonal depth axis from category 3D aspect-ratio prior when metric scale is measured.")
+    parser.add_argument("--user-weight", type=float, default=None,
+                        help="Optional user-declared cargo unit weight in kg.")
+    parser.add_argument("--user-weights", type=float, nargs="+", default=None,
+                        help="Optional user-declared cargo weights corresponding to items.")
+    parser.add_argument("--measured-scale-weight", type=float, default=None,
+                        help="Optional certified external scale measured weight in kg.")
     parser.add_argument("--json", action="store_true", help="Output raw JSON instead of formatted text.")
     args = parser.parse_args()
 
@@ -1251,6 +1372,8 @@ def main():
             image_paths=args.images,
             quantities=args.quantities,
             infer_aspect_depth=args.infer_aspect_depth,
+            user_weights_kg=args.user_weights,
+            measured_scale_weights_kg=[args.measured_scale_weight] * len(args.images) if args.measured_scale_weight is not None else None,
         )
 
         if args.json:
@@ -1280,13 +1403,14 @@ def main():
             c_sum = item["cargo_summary"]
             dim_str = f"{dims['length_cm']} x {dims['width_cm']} x {dims['height_cm']} cm" if dims.get('length_cm') else "Unmeasured"
             vol_str = f"{c_sum['total_volume_m3']:.4f} m³" if c_sum.get('total_volume_m3') else "N/A"
-            wt_str = f"{c_sum['total_weight_kg']:.1f} kg" if c_sum.get('total_weight_kg') is not None else "N/A"
+            w_src_tag = f" ({c_sum.get('weight_source', 'estimated')})" if c_sum.get('weight_source') else ""
+            wt_str = f"{c_sum['total_weight_kg']:.1f} kg{w_src_tag}" if c_sum.get('total_weight_kg') is not None else "N/A"
             print(f"{idx+1:>2}. {cat:<16} x{qty:<3} (Unit: {dim_str}, Vol: {vol_str}, Wt: {wt_str})")
 
         print(f"\nTOTAL ITEMS:      {result['total_items']}")
         print(f"TOTAL VOLUME:     {summary['total_volume_m3']:.4f} m³" if summary.get('total_volume_m3') else "TOTAL VOLUME:     N/A")
         print(f"TOTAL FLOOR AREA: {summary['total_floor_area_m2']:.4f} m²" if summary.get('total_floor_area_m2') else "TOTAL FLOOR AREA: N/A")
-        print(f"TOTAL WEIGHT:     {summary['total_weight_kg']:.2f} kg (estimated)" if summary.get('total_weight_kg') is not None else "TOTAL WEIGHT:     N/A")
+        print(f"TOTAL WEIGHT:     {summary['total_weight_kg']:.2f} kg ({summary.get('item_breakdown', [{}])[0].get('weight_source', 'estimated')})" if summary.get('total_weight_kg') is not None else "TOTAL WEIGHT:     N/A")
         print("-" * 78)
         print("RECOMMENDED VEHICLE")
         print("-" * 78)
@@ -1313,6 +1437,10 @@ def main():
         known_marker_size_cm=args.marker_size,
         object_bbox_px=tuple(args.bbox) if args.bbox else None,
         extract_all_objects=args.extract_all,
+        infer_aspect_depth=args.infer_aspect_depth,
+        user_weight_kg=args.user_weight,
+        measured_scale_weight_kg=args.measured_scale_weight,
+        user_weights_kg=args.user_weights,
     )
 
     if args.json:

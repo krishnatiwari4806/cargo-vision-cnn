@@ -61,6 +61,40 @@ class EstimationMethod(str, Enum):
     NONE = "NONE"
 
 
+class WeightSource(str, Enum):
+    SCALE_MEASURED = "scale_measured"
+    USER_PROVIDED = "user_provided"
+    DENSITY_ESTIMATE = "density_estimate"
+    CATEGORY_PRIOR = "category_prior"
+    NONE = "none"
+
+
+class WeightStatus(str, Enum):
+    MEASURED = "MEASURED"
+    USER_DECLARED = "USER_DECLARED"
+    ESTIMATED = "ESTIMATED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclass
+class WeightEstimateResult:
+    """
+    Standardized result schema for physical cargo weight estimation.
+    Enforces clear provenance and transparency regarding physical weight measurements.
+    """
+    weight_kg: Optional[float]
+    weight_source: str
+    weight_status: str
+    weight_confidence: float
+    weight_uncertainty_kg: Optional[float] = None
+    weight_uncertainty_percent: Optional[float] = None
+    warnings: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializes weight result to standard dictionary."""
+        return asdict(self)
+
+
 @dataclass
 class DimensionEstimateResult:
     """
@@ -82,6 +116,10 @@ class DimensionEstimateResult:
     measurement_confidence: Optional[float] = None
     depth_estimation_method: Optional[str] = None
     weight_source: Optional[str] = None
+    weight_status: Optional[str] = None
+    weight_confidence: Optional[float] = None
+    weight_uncertainty_kg: Optional[float] = None
+    weight_uncertainty_percent: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the result to a standard dictionary."""
@@ -89,8 +127,170 @@ class DimensionEstimateResult:
 
 
 # -----------------------------------------------------------------------------
-# Mode 2: Configurable Category Dimension Priors
+# Mode 2: Configurable Category Dimension Priors & Bulk Densities
 # -----------------------------------------------------------------------------
+
+CATEGORY_BULK_DENSITIES_KG_M3: Dict[str, float] = {
+    "box": 150.0,          # Corrugated shipping carton with mixed dry goods
+    "chair": 65.0,          # Office / dining chair envelope
+    "couch": 80.0,          # Upholstered living room sofa envelope
+    "table": 75.0,          # Wooden / composite dining table envelope
+    "suitcase": 200.0,      # Packed personal luggage envelope
+    "car": 120.0,           # Standard passenger sedan volumetric envelope
+    "refrigerator": 120.0,  # Domestic refrigerator appliance envelope
+    "tv": 110.0,            # Flat-screen TV carton envelope
+    "bed": 40.0,            # Bed frame and mattress volumetric envelope
+    "desk": 70.0,           # Office workstation desk envelope
+}
+
+
+def resolve_weight(
+    category: Optional[str] = None,
+    measured_scale_weight_kg: Optional[float] = None,
+    user_weight_kg: Optional[float] = None,
+    metric_volume_m3: Optional[float] = None,
+    custom_density_kg_m3: Optional[float] = None,
+    priors: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> WeightEstimateResult:
+    """
+    Unified multi-tier weight resolution engine enforcing strict priority:
+      Priority 1: SCALE_MEASURED (Certified external scale / weighbridge measurement)
+      Priority 2: USER_PROVIDED (Explicit user / shipping manifest declared weight)
+      Priority 3: DENSITY_ESTIMATE (Metric volume * material bulk density prior)
+      Priority 4: CATEGORY_PRIOR (Default standard parametric catalog envelope)
+      Fallback:   UNAVAILABLE (Missing / unknown category and no external weight)
+
+    Physical Reality Rationale:
+      A 2D monocular RGB image captures surface radiance, not gravitational mass or density.
+      Therefore, physical weight can only be authoritatively established via external hardware scales,
+      user manifests, or conservative engineering density/prior models.
+    """
+    if priors is None:
+        priors = DEFAULT_CATEGORY_PRIORS
+
+    warnings = []
+
+    # -------------------------------------------------------------------------
+    # Priority 1: Certified External Scale Measurement (SCALE_MEASURED)
+    # -------------------------------------------------------------------------
+    if measured_scale_weight_kg is not None:
+        try:
+            scale_val = float(measured_scale_weight_kg)
+            if scale_val > 0:
+                scale_val_rounded = round(scale_val, 2)
+                # Certified scale has high precision (approx +/- 0.5% engineering uncertainty)
+                unc_kg = round(scale_val_rounded * 0.005, 2)
+                return WeightEstimateResult(
+                    weight_kg=scale_val_rounded,
+                    weight_source=WeightSource.SCALE_MEASURED.value,
+                    weight_status=WeightStatus.MEASURED.value,
+                    weight_confidence=0.99,
+                    weight_uncertainty_kg=unc_kg,
+                    weight_uncertainty_percent=0.5,
+                    warnings=["Weight verified from external physical scale measurement."],
+                )
+            else:
+                warnings.append(
+                    f"Invalid non-positive measured scale weight ({scale_val} kg). Falling back to next weight tier."
+                )
+        except (ValueError, TypeError):
+            warnings.append(
+                f"Malformed scale weight input '{measured_scale_weight_kg}'. Falling back to next weight tier."
+            )
+
+    # -------------------------------------------------------------------------
+    # Priority 2: Explicit User / Manifest Weight (USER_PROVIDED)
+    # -------------------------------------------------------------------------
+    if user_weight_kg is not None:
+        try:
+            user_val = float(user_weight_kg)
+            if user_val > 0:
+                user_val_rounded = round(user_val, 2)
+                return WeightEstimateResult(
+                    weight_kg=user_val_rounded,
+                    weight_source=WeightSource.USER_PROVIDED.value,
+                    weight_status=WeightStatus.USER_DECLARED.value,
+                    weight_confidence=0.95,
+                    weight_uncertainty_kg=0.0,
+                    weight_uncertainty_percent=0.0,
+                    warnings=["Weight specified by user or shipping manifest."],
+                )
+            else:
+                warnings.append(
+                    f"Invalid non-positive user-provided weight ({user_val} kg). Falling back to next weight tier."
+                )
+        except (ValueError, TypeError):
+            warnings.append(
+                f"Malformed user weight input '{user_weight_kg}'. Falling back to next weight tier."
+            )
+
+    # -------------------------------------------------------------------------
+    # Priority 3: Metric Volume x Bulk Density Prior (DENSITY_ESTIMATE)
+    # -------------------------------------------------------------------------
+    cat_clean = category.strip().lower() if category is not None else None
+    if metric_volume_m3 is not None and metric_volume_m3 > 0:
+        density = custom_density_kg_m3
+        if density is None and cat_clean is not None:
+            density = CATEGORY_BULK_DENSITIES_KG_M3.get(cat_clean)
+
+        if density is not None and density > 0:
+            calc_weight = round(metric_volume_m3 * density, 2)
+            if calc_weight > 0:
+                unc_kg = round(calc_weight * 0.25, 2)
+                return WeightEstimateResult(
+                    weight_kg=calc_weight,
+                    weight_source=WeightSource.DENSITY_ESTIMATE.value,
+                    weight_status=WeightStatus.ESTIMATED.value,
+                    weight_confidence=0.70,
+                    weight_uncertainty_kg=unc_kg,
+                    weight_uncertainty_percent=25.0,
+                    warnings=[
+                        f"Weight estimated from measured metric volume ({metric_volume_m3:.4f} m³) and bulk density ({density:.1f} kg/m³).",
+                        "Material density is an engineering assumption (±25% uncertainty); actual weight may vary.",
+                    ],
+                )
+
+    # -------------------------------------------------------------------------
+    # Priority 4: Category Prior Standard Table (CATEGORY_PRIOR)
+    # -------------------------------------------------------------------------
+    if cat_clean is not None and cat_clean in priors:
+        prior_entry = priors[cat_clean]
+        default_wt = prior_entry.get("default_weight_kg")
+        if default_wt is not None and default_wt > 0:
+            wt_rounded = round(float(default_wt), 2)
+            unc_kg = round(wt_rounded * 0.40, 2)
+            prior_warnings = [
+                f"Payload suitability cannot be verified against a physical scale; weight ({wt_rounded:.1f} kg) is estimated from standard category priors.",
+                f"Weight is an ungrounded engineering estimate with ±40% population uncertainty. Physical scale verification is recommended before fleet dispatch.",
+            ]
+            prior_warnings.extend(warnings)
+            return WeightEstimateResult(
+                weight_kg=wt_rounded,
+                weight_source=WeightSource.CATEGORY_PRIOR.value,
+                weight_status=WeightStatus.ESTIMATED.value,
+                weight_confidence=0.50,
+                weight_uncertainty_kg=unc_kg,
+                weight_uncertainty_percent=40.0,
+                warnings=prior_warnings,
+            )
+
+    # -------------------------------------------------------------------------
+    # Fallback: Unavailable Weight
+    # -------------------------------------------------------------------------
+    fallback_warnings = [
+        "Payload suitability cannot be verified because physical object weight is unavailable.",
+    ]
+    fallback_warnings.extend(warnings)
+    return WeightEstimateResult(
+        weight_kg=None,
+        weight_source=WeightSource.NONE.value,
+        weight_status=WeightStatus.UNAVAILABLE.value,
+        weight_confidence=0.0,
+        weight_uncertainty_kg=None,
+        weight_uncertainty_percent=None,
+        warnings=fallback_warnings,
+    )
+
 
 DEFAULT_CATEGORY_PRIORS: Dict[str, Dict[str, Any]] = {
     "box": {
@@ -193,6 +393,8 @@ class CategoryPriorEstimator:
         self,
         category: str,
         detected_aspect_ratio_wh: Optional[float] = None,
+        user_weight_kg: Optional[float] = None,
+        measured_scale_weight_kg: Optional[float] = None,
     ) -> DimensionEstimateResult:
         """
         Estimates dimensions from category priors.
@@ -200,6 +402,8 @@ class CategoryPriorEstimator:
         Args:
             category: Cargo class name (e.g., 'box', 'couch', 'car').
             detected_aspect_ratio_wh: Optional 2D bbox width/height ratio for aspect adjustment.
+            user_weight_kg: Optional user-supplied weight override in kg.
+            measured_scale_weight_kg: Optional certified external scale weight in kg.
         """
         cat_key = category.strip().lower()
         if cat_key not in self._priors:
@@ -211,6 +415,12 @@ class CategoryPriorEstimator:
                 confidence=0.0,
                 measurement_confidence=0.0,
                 scale_cm_per_pixel=None,
+                weight_kg=None,
+                weight_source=WeightSource.NONE.value,
+                weight_status=WeightStatus.UNAVAILABLE.value,
+                weight_confidence=0.0,
+                weight_uncertainty_kg=None,
+                weight_uncertainty_percent=None,
                 reference={"type": None, "size_cm": None, "detected": False},
                 warnings=[f"Unknown category '{category}'. No prior dimensions configured."],
             )
@@ -220,13 +430,21 @@ class CategoryPriorEstimator:
         width = float(prior["width_cm"])
         height = float(prior["height_cm"])
         conf = float(prior.get("confidence", 0.60))
-        weight = float(prior["default_weight_kg"]) if "default_weight_kg" in prior and prior["default_weight_kg"] is not None else None
+
+        # Multi-tier weight resolution
+        weight_res = resolve_weight(
+            category=cat_key,
+            user_weight_kg=user_weight_kg,
+            measured_scale_weight_kg=measured_scale_weight_kg,
+            priors=self._priors,
+        )
 
         warnings = [
             f"Dimensions for '{cat_key}' are estimated from standard category priors ({prior.get('description', '')}).",
             "This is NOT a direct physical measurement. Actual dimensions may vary.",
             "User verification or physical tape measurement is recommended before fleet dispatch.",
         ]
+        warnings.extend(weight_res.warnings)
 
         # Deterministic population variability uncertainty (+/- 25% for unconstrained category envelope)
         uncertainty_percent = {"length": 25.0, "width": 25.0, "height": 25.0}
@@ -248,8 +466,12 @@ class CategoryPriorEstimator:
             confidence=conf,
             measurement_confidence=conf,
             scale_cm_per_pixel=None,
-            weight_kg=round(weight, 2) if weight is not None else None,
-            weight_source="category_prior" if weight is not None else None,
+            weight_kg=weight_res.weight_kg,
+            weight_source=weight_res.weight_source,
+            weight_status=weight_res.weight_status,
+            weight_confidence=weight_res.weight_confidence,
+            weight_uncertainty_kg=weight_res.weight_uncertainty_kg,
+            weight_uncertainty_percent=weight_res.weight_uncertainty_percent,
             depth_estimation_method="category_prior_default",
             uncertainty_percent=uncertainty_percent,
             uncertainty_cm=uncertainty_cm,
@@ -397,10 +619,6 @@ class ReferenceMarkerEstimator:
         if p_l <= 0 or p_w <= 0 or p_h <= 0 or measured_short_cm <= 0 or measured_long_cm <= 0:
             return None, None, ["Invalid dimensions for aspect ratio depth inference."]
 
-        # 3 potential planar view pairings from canonical (L, W, H):
-        # 1. Front/Back view: Length x Height (missing: Width)
-        # 2. Top/Bottom view: Length x Width (missing: Height)
-        # 3. Side view: Width x Height (missing: Length)
         view_configs = [
             {
                 "name": "front_view",
@@ -427,7 +645,6 @@ class ReferenceMarkerEstimator:
 
         obs_ratio = measured_long_cm / measured_short_cm
 
-        # Find best matching view orientation by comparing aspect ratios
         best_config = None
         min_discrepancy = float("inf")
         for cfg in view_configs:
@@ -440,7 +657,6 @@ class ReferenceMarkerEstimator:
         if best_config is None:
             return None, None, ["Failed to match aspect ratio."]
 
-        # Scale factor from measured dimensions to prior canonical size
         scale_factor = 0.5 * ((measured_long_cm / best_config["dim1"]) + (measured_short_cm / best_config["dim2"]))
         inferred_depth = round(scale_factor * best_config["missing_dim_val"], 1)
 
@@ -458,6 +674,10 @@ class ReferenceMarkerEstimator:
         object_bbox_px: Tuple[int, int, int, int],
         category: Optional[str] = None,
         infer_aspect_depth: bool = False,
+        user_weight_kg: Optional[float] = None,
+        measured_scale_weight_kg: Optional[float] = None,
+        use_density_weight: bool = False,
+        custom_density_kg_m3: Optional[float] = None,
     ) -> DimensionEstimateResult:
         """
         Executes reference-marker measurement on the target object bounding box.
@@ -468,6 +688,10 @@ class ReferenceMarkerEstimator:
             object_bbox_px: (xmin, ymin, xmax, ymax) of the detected object in pixels.
             category: Optional object class name for depth ratio priors.
             infer_aspect_depth: When True and category is known, infers the missing orthogonal depth axis.
+            user_weight_kg: Optional user-provided weight in kg.
+            measured_scale_weight_kg: Optional externally measured scale weight in kg.
+            use_density_weight: When True and 3D volume is available, estimates weight via material density.
+            custom_density_kg_m3: Optional custom density override in kg/m^3.
         """
         if known_marker_size_cm <= 0:
             return DimensionEstimateResult(
@@ -478,6 +702,12 @@ class ReferenceMarkerEstimator:
                 confidence=0.0,
                 measurement_confidence=0.0,
                 scale_cm_per_pixel=None,
+                weight_kg=None,
+                weight_source=WeightSource.NONE.value,
+                weight_status=WeightStatus.UNAVAILABLE.value,
+                weight_confidence=0.0,
+                weight_uncertainty_kg=None,
+                weight_uncertainty_percent=None,
                 reference={"type": "aruco", "size_cm": known_marker_size_cm, "detected": False},
                 warnings=[f"Invalid marker physical size: {known_marker_size_cm} cm. Must be positive."],
             )
@@ -495,6 +725,12 @@ class ReferenceMarkerEstimator:
                 confidence=0.0,
                 measurement_confidence=0.0,
                 scale_cm_per_pixel=None,
+                weight_kg=None,
+                weight_source=WeightSource.NONE.value,
+                weight_status=WeightStatus.UNAVAILABLE.value,
+                weight_confidence=0.0,
+                weight_uncertainty_kg=None,
+                weight_uncertainty_percent=None,
                 reference={"type": "aruco", "size_cm": known_marker_size_cm, "detected": False},
                 warnings=["Invalid object bounding box: width and height must be positive."],
             )
@@ -510,6 +746,12 @@ class ReferenceMarkerEstimator:
                 confidence=0.0,
                 measurement_confidence=0.0,
                 scale_cm_per_pixel=None,
+                weight_kg=None,
+                weight_source=WeightSource.NONE.value,
+                weight_status=WeightStatus.UNAVAILABLE.value,
+                weight_confidence=0.0,
+                weight_uncertainty_kg=None,
+                weight_uncertainty_percent=None,
                 reference={"type": "aruco", "size_cm": known_marker_size_cm, "detected": False},
                 warnings=[f"Failed to process image for marker detection: {str(e)}"],
             )
@@ -523,6 +765,12 @@ class ReferenceMarkerEstimator:
                 confidence=0.0,
                 measurement_confidence=0.0,
                 scale_cm_per_pixel=None,
+                weight_kg=None,
+                weight_source=WeightSource.NONE.value,
+                weight_status=WeightStatus.UNAVAILABLE.value,
+                weight_confidence=0.0,
+                weight_uncertainty_kg=None,
+                weight_uncertainty_percent=None,
                 reference={"type": "aruco", "size_cm": known_marker_size_cm, "detected": False},
                 warnings=[
                     "No valid ArUco reference marker detected in image.",
@@ -581,13 +829,19 @@ class ReferenceMarkerEstimator:
         else:
             warnings.append("Orthogonal depth (width) is unmeasured from a single monocular view.")
 
-        # Default category weight if category known
-        weight_val = None
-        weight_src = None
-        if category is not None and category.strip().lower() in DEFAULT_CATEGORY_PRIORS:
-            prior_entry = DEFAULT_CATEGORY_PRIORS[category.strip().lower()]
-            weight_val = prior_entry.get("default_weight_kg")
-            weight_src = "category_prior"
+        # Multi-tier weight resolution
+        metric_vol_m3 = None
+        if length_cm is not None and width_cm is not None and height_cm is not None:
+            metric_vol_m3 = (length_cm * width_cm * height_cm) / 1000000.0
+
+        weight_res = resolve_weight(
+            category=category,
+            measured_scale_weight_kg=measured_scale_weight_kg,
+            user_weight_kg=user_weight_kg,
+            metric_volume_m3=metric_vol_m3 if use_density_weight else None,
+            custom_density_kg_m3=custom_density_kg_m3,
+        )
+        warnings.extend(weight_res.warnings)
 
         return DimensionEstimateResult(
             status=EstimationStatus.MEASURED.value,
@@ -601,8 +855,12 @@ class ReferenceMarkerEstimator:
             confidence=conf,
             measurement_confidence=conf,
             scale_cm_per_pixel=round(scale_cm_per_px, 6),
-            weight_kg=round(weight_val, 2) if weight_val is not None else None,
-            weight_source=weight_src,
+            weight_kg=weight_res.weight_kg,
+            weight_source=weight_res.weight_source,
+            weight_status=weight_res.weight_status,
+            weight_confidence=weight_res.weight_confidence,
+            weight_uncertainty_kg=weight_res.weight_uncertainty_kg,
+            weight_uncertainty_percent=weight_res.weight_uncertainty_percent,
             depth_estimation_method=depth_method,
             uncertainty_percent=uncertainty_percent,
             uncertainty_cm=uncertainty_cm,
@@ -625,7 +883,7 @@ class DimensionEstimator:
     """
     Unified Hybrid Dimension Estimation Engine.
     Orchestrates Reference-Marker Measurement (Mode 1), Aspect-Ratio Depth Inference (Mode 1b),
-    and Category-Prior Fallback (Mode 2).
+    and Category-Prior Fallback (Mode 2) with multi-tier weight resolution.
     """
 
     def __init__(
@@ -644,14 +902,19 @@ class DimensionEstimator:
         object_bbox_px: Optional[Tuple[int, int, int, int]] = None,
         fallback_to_prior: bool = True,
         infer_aspect_depth: bool = False,
+        user_weight_kg: Optional[float] = None,
+        measured_scale_weight_kg: Optional[float] = None,
+        use_density_weight: bool = False,
+        custom_density_kg_m3: Optional[float] = None,
     ) -> DimensionEstimateResult:
         """
-        Main entry point for physical dimension estimation.
+        Main entry point for physical dimension and weight estimation.
         
         Workflow:
           1. If image, marker size, and bbox are provided, attempts Reference-Marker Measurement.
           2. If marker is missing/unusable and fallback_to_prior=True and category is given, returns Category Prior.
-          3. Otherwise returns REFERENCE_REQUIRED or ERROR.
+          3. Multi-tier weight resolution executes across all modes (Scale > User > Density > Prior).
+          4. Otherwise returns REFERENCE_REQUIRED or ERROR.
         """
         # 1. Attempt Mode 1 (Reference Measurement) if parameters provided
         if image_input is not None and known_marker_size_cm is not None and object_bbox_px is not None:
@@ -661,12 +924,20 @@ class DimensionEstimator:
                 object_bbox_px=object_bbox_px,
                 category=category,
                 infer_aspect_depth=infer_aspect_depth,
+                user_weight_kg=user_weight_kg,
+                measured_scale_weight_kg=measured_scale_weight_kg,
+                use_density_weight=use_density_weight,
+                custom_density_kg_m3=custom_density_kg_m3,
             )
             if res.status == EstimationStatus.MEASURED.value:
                 return res
             elif res.status == EstimationStatus.REFERENCE_REQUIRED.value and fallback_to_prior and category:
                 # Fallback to Mode 2 with combined warning
-                prior_res = self.prior_estimator.estimate(category)
+                prior_res = self.prior_estimator.estimate(
+                    category=category,
+                    user_weight_kg=user_weight_kg,
+                    measured_scale_weight_kg=measured_scale_weight_kg,
+                )
                 prior_res.warnings.insert(
                     0, "Reference marker was NOT detected. Falling back to category-prior estimate."
                 )
@@ -676,7 +947,11 @@ class DimensionEstimator:
 
         # 2. Mode 2 direct execution (if no marker measurement requested)
         if category is not None:
-            return self.prior_estimator.estimate(category)
+            return self.prior_estimator.estimate(
+                category=category,
+                user_weight_kg=user_weight_kg,
+                measured_scale_weight_kg=measured_scale_weight_kg,
+            )
 
         # 3. Insufficient parameters
         return DimensionEstimateResult(
@@ -687,6 +962,13 @@ class DimensionEstimator:
             confidence=0.0,
             measurement_confidence=0.0,
             scale_cm_per_pixel=None,
+            weight_kg=None,
+            weight_source=WeightSource.NONE.value,
+            weight_status=WeightStatus.UNAVAILABLE.value,
+            weight_confidence=0.0,
+            weight_uncertainty_kg=None,
+            weight_uncertainty_percent=None,
             reference={"type": None, "size_cm": None, "detected": False},
             warnings=["Insufficient input parameters: provide either (image, marker_size, bbox) or a valid category."],
         )
+

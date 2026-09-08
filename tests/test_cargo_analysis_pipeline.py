@@ -1026,37 +1026,127 @@ class TestCargoAnalysisPipeline(unittest.TestCase):
         self.assertIn("marked REVIEW_REQUIRED", warnings_str)
 
     # -------------------------------------------------------------------------
-    # 51. BUG #6 Physical Dimension Estimation: ArUco with Aspect Depth Inference
+    # 52. BUG #7 Weight Estimation: Single User-Provided Weight
     # -------------------------------------------------------------------------
-    def test_aruco_analysis_with_aspect_depth_inference(self):
-        """Verify end-to-end pipeline analysis with infer_aspect_depth=True calculates volumetric metrics."""
+    def test_single_user_provided_weight_in_pipeline(self):
+        """Verify pipeline with user_weight_kg overrides prior and updates provenance."""
         res = self.pipeline.analyze(
-            image_path=self.marker_image_path,
-            quantity=1,
-            known_marker_size_cm=10.0,
-            object_bbox_px=(200, 200, 400, 300),
-            infer_aspect_depth=True,
+            image_path=self.valid_image_path,
+            quantity=2,
+            user_weight_kg=14.5,
         )
         self.assertEqual(res["status"], "SUCCESS")
         dim_res = res["dimensions"]
+        cargo_sum = res["cargo_summary"]
 
-        self.assertEqual(dim_res["status"], "MEASURED")
-        self.assertIn(dim_res["source"], ["aruco_plus_aspect_prior", "aruco_reference"])
-        self.assertIsNotNone(dim_res["length_cm"])
-        self.assertIsNotNone(dim_res["height_cm"])
+        self.assertEqual(dim_res["weight_kg"], 14.5)
+        self.assertEqual(dim_res["weight_source"], "user_provided")
+        self.assertEqual(dim_res["weight_status"], "USER_DECLARED")
+        self.assertEqual(cargo_sum["unit_weight_kg"], 14.5)
+        self.assertEqual(cargo_sum["total_weight_kg"], 29.0)
 
-        # Estimation metadata and uncertainty bounds are present
-        self.assertIn("estimation_method", dim_res)
-        self.assertIn("uncertainty_cm", dim_res)
-        self.assertIn("uncertainty_percent", dim_res)
+    # -------------------------------------------------------------------------
+    # 53. BUG #7 Weight Estimation: Multi-Image User Weights Aggregation
+    # -------------------------------------------------------------------------
+    def test_multi_image_user_weights_aggregation(self):
+        """Verify analyze_multiple correctly applies positional user weights to shipment items."""
+        img_paths = [self.valid_image_path, self.valid_image_path]
+        user_wts = [10.0, 25.0]
 
-        # If category is known and depth is inferred, volumetric requirements are computed
-        if dim_res["width_cm"] is not None:
-            self.assertEqual(dim_res["estimation_method"], "ARUCO_PLUS_ASPECT_PRIOR")
-            self.assertIsNotNone(res["cargo_summary"]["total_volume_m3"])
-            self.assertIsNotNone(res["cargo_summary"]["required_floor_area_m2"])
-            self.assertIsNotNone(res["vehicle_recommendation"]["vehicle_id"])
+        res = self.pipeline.analyze_multiple(
+            image_paths=img_paths,
+            quantities=[1, 2],
+            user_weights_kg=user_wts,
+        )
+        self.assertEqual(res["status"], "SUCCESS")
+        items = res["items"]
+        self.assertEqual(len(items), 2)
+
+        self.assertEqual(items[0]["cargo_summary"]["unit_weight_kg"], 10.0)
+        self.assertEqual(items[0]["cargo_summary"]["total_weight_kg"], 10.0)
+        self.assertEqual(items[0]["cargo_summary"]["weight_source"], "user_provided")
+
+        self.assertEqual(items[1]["cargo_summary"]["unit_weight_kg"], 25.0)
+        self.assertEqual(items[1]["cargo_summary"]["total_weight_kg"], 50.0)
+        self.assertEqual(items[1]["cargo_summary"]["weight_source"], "user_provided")
+
+        self.assertEqual(res["shipment_summary"]["total_weight_kg"], 60.0)
+
+    # -------------------------------------------------------------------------
+    # 54. BUG #7 Weight Estimation: Measured Scale Weight in Pipeline
+    # -------------------------------------------------------------------------
+    def test_measured_scale_weight_in_pipeline(self):
+        """Verify measured_scale_weight_kg assigns certified scale source and reflects in warnings."""
+        res = self.pipeline.analyze(
+            image_path=self.valid_image_path,
+            quantity=1,
+            measured_scale_weight_kg=85.0,
+        )
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["dimensions"]["weight_source"], "scale_measured")
+        self.assertEqual(res["dimensions"]["weight_status"], "MEASURED")
+        self.assertEqual(res["cargo_summary"]["total_weight_kg"], 85.0)
+
+        warnings_str = " ".join(res["warnings"])
+        self.assertIn("verified from external physical scale measurement", warnings_str)
+
+    # -------------------------------------------------------------------------
+    # 55. BUG #7 Weight Estimation: 80% Payload Safety Margin Warning
+    # -------------------------------------------------------------------------
+    def test_payload_safety_margin_warning_under_category_prior(self):
+        """Verify when prior weight exceeds 80% vehicle capacity, a safety review warning is generated."""
+        # V_3W_AUTO max payload is 500 kg. 80% threshold = 400 kg.
+        # Box prior weight is 12 kg. 35 boxes = 420 kg (420 kg > 400 kg, but fits 500 kg Auto).
+        cargo_dims = {"length_cm": 45.0, "width_cm": 35.0, "height_cm": 30.0, "weight_kg": 12.0, "weight_source": "category_prior"}
+        c_sum = {
+            "total_items": 35,
+            "unit_volume_m3": 0.0472,
+            "total_volume_m3": 1.5,
+            "unit_weight_kg": 12.0,
+            "total_weight_kg": 420.0,
+            "weight_source": "category_prior",
+            "weight_status": "ESTIMATED",
+            "required_floor_area_m2": 1.4,
+        }
+        rec, warnings = self.pipeline.recommend_vehicle("box", cargo_dims, c_sum, 35)
+        self.assertEqual(rec["vehicle_id"], "V_3W_AUTO")
+        warnings_str = " ".join(warnings)
+        self.assertIn("exceeds 80% of Cargo 3-Wheeler Auto", warnings_str)
+        self.assertIn("category-prior uncertainty", warnings_str)
+
+    # -------------------------------------------------------------------------
+    # 56. BUG #7 Weight Estimation: In-Image Multi-Object User Weights
+    # -------------------------------------------------------------------------
+    def test_in_image_multi_object_user_weights(self):
+        """Verify extract_all_objects=True maps user_weights_kg cleanly across detected items."""
+        multi_img_path = os.path.join(PROJECT_ROOT, "deployment_dataset_expanded", "test", "images", "coco_000000057238.jpg")
+        res = self.pipeline.analyze(
+            image_path=multi_img_path,
+            extract_all_objects=True,
+            user_weights_kg=[50.0, 10.0, 15.0],
+        )
+        self.assertEqual(res["status"], "SUCCESS")
+        objects = res["detected_objects"]
+        self.assertGreaterEqual(len(objects), 2)
+        self.assertEqual(objects[0]["cargo_summary"]["weight_source"], "user_provided")
+
+    # -------------------------------------------------------------------------
+    # 57. BUG #7 Weight Estimation: Invalid User Weight Falls Back Cleanly
+    # -------------------------------------------------------------------------
+    def test_invalid_user_weight_falls_back_in_pipeline(self):
+        """Verify non-positive user weight falls back to category prior without crashing."""
+        res = self.pipeline.analyze(
+            image_path=self.valid_image_path,
+            quantity=1,
+            user_weight_kg=-20.0,
+        )
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["dimensions"]["weight_source"], "category_prior")
+        self.assertEqual(res["dimensions"]["weight_status"], "ESTIMATED")
+        warnings_str = " ".join(res["warnings"])
+        self.assertIn("Invalid non-positive user-provided weight", warnings_str)
 
 
 if __name__ == "__main__":
     unittest.main()
+

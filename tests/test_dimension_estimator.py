@@ -24,6 +24,9 @@ from scripts.dimension_estimator import (
     DimensionEstimateResult,
     EstimationStatus,
     MeasurementSource,
+    WeightSource,
+    WeightStatus,
+    resolve_weight,
     DEFAULT_CATEGORY_PRIORS,
 )
 
@@ -331,7 +334,124 @@ class TestDimensionEstimator(unittest.TestCase):
         self.assertEqual(res.estimation_method, "ARUCO_PLUS_ASPECT_PRIOR")
         self.assertIsNotNone(res.dimensions_cm["width"])
 
+    # -------------------------------------------------------------------------
+    # 16. Category Prior Weight & Uncertainty Metadata (BUG #7)
+    # -------------------------------------------------------------------------
+    def test_category_prior_weight_and_uncertainty(self):
+        """Verify Category Prior returns explicit weight metadata, source, and uncertainty."""
+        res = self.prior_estimator.estimate("box")
+        self.assertEqual(res.weight_kg, 12.0)
+        self.assertEqual(res.weight_source, WeightSource.CATEGORY_PRIOR.value)
+        self.assertEqual(res.weight_status, WeightStatus.ESTIMATED.value)
+        self.assertEqual(res.weight_confidence, 0.50)
+        self.assertEqual(res.weight_uncertainty_percent, 40.0)
+        self.assertEqual(res.weight_uncertainty_kg, 4.8)
+
+    # -------------------------------------------------------------------------
+    # 17. User-Provided Weight Overrides Prior (BUG #7)
+    # -------------------------------------------------------------------------
+    def test_user_provided_weight_overrides_prior(self):
+        """Verify user_weight_kg overrides category prior and updates weight provenance."""
+        res = self.prior_estimator.estimate("box", user_weight_kg=15.5)
+        self.assertEqual(res.weight_kg, 15.5)
+        self.assertEqual(res.weight_source, WeightSource.USER_PROVIDED.value)
+        self.assertEqual(res.weight_status, WeightStatus.USER_DECLARED.value)
+        self.assertEqual(res.weight_confidence, 0.95)
+        self.assertEqual(res.weight_uncertainty_kg, 0.0)
+        self.assertEqual(res.weight_uncertainty_percent, 0.0)
+
+    # -------------------------------------------------------------------------
+    # 18. Scale-Measured Weight Representation (BUG #7)
+    # -------------------------------------------------------------------------
+    def test_scale_measured_weight_representation(self):
+        """Verify measured_scale_weight_kg sets certified scale source and high confidence."""
+        res = self.unified_estimator.estimate(
+            category="couch",
+            measured_scale_weight_kg=72.4,
+        )
+        self.assertEqual(res.weight_kg, 72.4)
+        self.assertEqual(res.weight_source, WeightSource.SCALE_MEASURED.value)
+        self.assertEqual(res.weight_status, WeightStatus.MEASURED.value)
+        self.assertEqual(res.weight_confidence, 0.99)
+        self.assertEqual(res.weight_uncertainty_percent, 0.5)
+
+    # -------------------------------------------------------------------------
+    # 19. Invalid User Weight Falls Back Safely (BUG #7)
+    # -------------------------------------------------------------------------
+    def test_invalid_user_weight_falls_back_safely(self):
+        """Verify non-positive user weight is rejected with fallback to category prior."""
+        res = self.prior_estimator.estimate("table", user_weight_kg=-10.0)
+        self.assertEqual(res.weight_kg, 25.0)
+        self.assertEqual(res.weight_source, WeightSource.CATEGORY_PRIOR.value)
+        self.assertEqual(res.weight_status, WeightStatus.ESTIMATED.value)
+        warnings_str = " ".join(res.warnings)
+        self.assertIn("Invalid non-positive user-provided weight", warnings_str)
+
+    # -------------------------------------------------------------------------
+    # 20. Unknown Category Weight Unavailable (BUG #7)
+    # -------------------------------------------------------------------------
+    def test_unknown_category_weight_unavailable(self):
+        """Verify unknown category returns weight_kg=None and UNAVAILABLE status without crashing."""
+        res = self.prior_estimator.estimate("quantum_hypercube")
+        self.assertIsNone(res.weight_kg)
+        self.assertEqual(res.weight_source, WeightSource.NONE.value)
+        self.assertEqual(res.weight_status, WeightStatus.UNAVAILABLE.value)
+        self.assertEqual(res.weight_confidence, 0.0)
+
+    # -------------------------------------------------------------------------
+    # 21. Density-Based Weight Inference (BUG #7)
+    # -------------------------------------------------------------------------
+    def test_density_based_weight_inference(self):
+        """Verify metric volume * density prior yields DENSITY_ESTIMATE source and uncertainty."""
+        res = self.ref_estimator.measure_dimensions(
+            image_input=self.canvas_with_marker,
+            known_marker_size_cm=self.marker_size_cm,
+            object_bbox_px=(200, 200, 600, 400),
+            category="box",
+            infer_aspect_depth=True,
+            use_density_weight=True,
+        )
+        self.assertEqual(res.status, EstimationStatus.MEASURED.value)
+        self.assertEqual(res.weight_source, WeightSource.DENSITY_ESTIMATE.value)
+        self.assertEqual(res.weight_status, WeightStatus.ESTIMATED.value)
+        self.assertEqual(res.weight_confidence, 0.70)
+        self.assertIsNotNone(res.weight_kg)
+        self.assertGreater(res.weight_kg, 0.0)
+        self.assertEqual(res.weight_uncertainty_percent, 25.0)
+
+    # -------------------------------------------------------------------------
+    # 22. Weight Resolution Priority Order (BUG #7)
+    # -------------------------------------------------------------------------
+    def test_weight_resolution_priority_order(self):
+        """Verify strict priority: Scale > User > Density > Prior."""
+        # When both Scale and User provided, Scale wins
+        res_scale_user = resolve_weight(
+            category="chair",
+            measured_scale_weight_kg=10.0,
+            user_weight_kg=12.0,
+            metric_volume_m3=0.1,
+        )
+        self.assertEqual(res_scale_user.weight_source, WeightSource.SCALE_MEASURED.value)
+        self.assertEqual(res_scale_user.weight_kg, 10.0)
+
+        # When User and Density provided, User wins
+        res_user_density = resolve_weight(
+            category="chair",
+            user_weight_kg=12.0,
+            metric_volume_m3=0.1,
+        )
+        self.assertEqual(res_user_density.weight_source, WeightSource.USER_PROVIDED.value)
+        self.assertEqual(res_user_density.weight_kg, 12.0)
+
+        # When only Density provided, Density wins over Prior
+        res_density = resolve_weight(
+            category="chair",
+            metric_volume_m3=0.1,
+        )
+        self.assertEqual(res_density.weight_source, WeightSource.DENSITY_ESTIMATE.value)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
