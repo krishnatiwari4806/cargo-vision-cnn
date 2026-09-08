@@ -30,6 +30,24 @@ if PROJECT_ROOT not in sys.path:
 
 import torch
 from ultralytics import YOLO
+from ultralytics.engine.trainer import BaseTrainer
+import time
+
+# Windows/OneDrive file lock mitigation for results.csv
+_orig_save_metrics = BaseTrainer.save_metrics
+
+def _robust_save_metrics(self, metrics=None):
+    for attempt in range(10):
+        try:
+            return _orig_save_metrics(self, metrics=metrics)
+        except PermissionError as e:
+            if attempt < 9:
+                time.sleep(1.0)
+            else:
+                print(f"[WARNING] save_metrics hit PermissionError on results.csv after 10 retries: {e}", flush=True)
+                return
+
+BaseTrainer.save_metrics = _robust_save_metrics
 
 
 def compute_file_hash(filepath: str) -> str:
@@ -177,6 +195,8 @@ def train_cargo_yolo_exp_v3(
     project_dir: str = "runs/detect",
     name: str = "cargo_yolo_exp_v3",
     output_model_path: str = "models/cargo_yolo_exp_v3_best.pt",
+    resume: bool = False,
+    eval_test: bool = False,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -217,6 +237,7 @@ def train_cargo_yolo_exp_v3(
     print(f"Scale Augmentation:    {scale} (Multi-scale range +/- 50%)")
     print(f"Mosaic / Close Mosaic: {mosaic} / {close_mosaic} epochs")
     print(f"Random Seed:           {seed} (deterministic=True)")
+    print(f"Resume Mode:           {resume}")
     print(f"Dataset Verification:  TRAIN={config['dataset_safety']['train_images']} | VALID={config['dataset_safety']['valid_images']} | TEST={config['dataset_safety']['test_images']}")
     print(f"Test Set Isolation:    0 train/test overlap, 0 valid/test overlap (SAFE)")
     print("=" * 80)
@@ -230,37 +251,53 @@ def train_cargo_yolo_exp_v3(
     os.makedirs(os.path.join(PROJECT_ROOT, "models"), exist_ok=True)
     os.makedirs(os.path.join(PROJECT_ROOT, "results", "training"), exist_ok=True)
 
-    # 1. Initialize YOLO model
-    model = YOLO(config["base_model_path"])
+    save_dir = os.path.join(project_dir, name)
+    last_weights_path = os.path.join(save_dir, "weights", "last.pt")
 
-    # 2. Execute Training
-    train_results = model.train(
-        data=config["dataset_yaml"],
-        epochs=epochs,
-        imgsz=imgsz,
-        batch=batch_size,
-        lr0=lr0,
-        lrf=lrf,
-        weight_decay=weight_decay,
-        warmup_epochs=warmup_epochs,
-        optimizer="AdamW",
-        cos_lr=True,
-        box=box,
-        scale=scale,
-        mosaic=mosaic,
-        close_mosaic=close_mosaic,
-        seed=seed,
-        deterministic=True,
-        # Execution & Saving
-        project=project_dir,
-        name=name,
-        exist_ok=True,
-        verbose=True,
-        val=True,
-        save=True,
-        plots=True,
-        workers=0,
-    )
+    if resume:
+        if not os.path.exists(last_weights_path):
+            # check nested run directory if created by Ultralytics
+            nested_last = os.path.join(project_dir, project_dir, name, "weights", "last.pt")
+            if os.path.exists(nested_last):
+                last_weights_path = nested_last
+            else:
+                raise FileNotFoundError(f"Cannot resume: last checkpoint not found at: {last_weights_path}")
+        print(f"\n[RESUME] Resuming training from checkpoint: {last_weights_path}")
+        model = YOLO(last_weights_path)
+        train_results = model.train(resume=True)
+    else:
+        # 1. Initialize YOLO model
+        model = YOLO(config["base_model_path"])
+
+        # 2. Execute Training
+        train_results = model.train(
+            data=config["dataset_yaml"],
+            epochs=epochs,
+            imgsz=imgsz,
+            batch=batch_size,
+            lr0=lr0,
+            lrf=lrf,
+            weight_decay=weight_decay,
+            warmup_epochs=warmup_epochs,
+            optimizer="AdamW",
+            cos_lr=True,
+            box=box,
+            scale=scale,
+            mosaic=mosaic,
+            close_mosaic=close_mosaic,
+            seed=seed,
+            deterministic=True,
+            # Execution & Saving
+            project=project_dir,
+            name=name,
+            exist_ok=True,
+            verbose=True,
+            val=True,
+            save=True,
+            plots=True,
+            workers=0,
+        )
+
 
     # 3. Locate best model weights
     save_dir = str(getattr(train_results, "save_dir", os.path.join(project_dir, name)))
@@ -277,14 +314,14 @@ def train_cargo_yolo_exp_v3(
     else:
         raise FileNotFoundError(f"Could not locate trained weights in: {save_dir}")
 
-    # 4. Evaluate on HELD-OUT TEST split only
+    # 4. Post-training validation on VALID split
     print("\n" + "=" * 80)
-    print("EVALUATING EXP V3 CHECKPOINT ON HELD-OUT TEST SPLIT...")
+    print("EVALUATING BEST EXP V3 CHECKPOINT ON VALIDATION SPLIT...")
     print("=" * 80)
     best_model = YOLO(target_path)
-    test_metrics = best_model.val(
+    val_metrics = best_model.val(
         data=config["dataset_yaml"],
-        split="test",
+        split="val",
         imgsz=imgsz,
         batch=batch_size,
         verbose=True,
@@ -296,16 +333,35 @@ def train_cargo_yolo_exp_v3(
         "checkpoint": target_path,
         "imgsz": imgsz,
         "epochs": epochs,
-        "test_precision": round(float(test_metrics.results_dict.get("metrics/precision(B)", 0.0)), 4),
-        "test_recall": round(float(test_metrics.results_dict.get("metrics/recall(B)", 0.0)), 4),
-        "test_mAP50": round(float(test_metrics.results_dict.get("metrics/mAP50(B)", 0.0)), 4),
-        "test_mAP50_95": round(float(test_metrics.results_dict.get("metrics/mAP50-95(B)", 0.0)), 4),
+        "val_precision": round(float(val_metrics.results_dict.get("metrics/precision(B)", 0.0)), 4),
+        "val_recall": round(float(val_metrics.results_dict.get("metrics/recall(B)", 0.0)), 4),
+        "val_mAP50": round(float(val_metrics.results_dict.get("metrics/mAP50(B)", 0.0)), 4),
+        "val_mAP50_95": round(float(val_metrics.results_dict.get("metrics/mAP50-95(B)", 0.0)), 4),
     }
 
-    eval_json_path = os.path.join(PROJECT_ROOT, "results", "training", f"{name}_test_report.json")
+    if eval_test:
+        print("\n" + "=" * 80)
+        print("EVALUATING EXP V3 CHECKPOINT ON HELD-OUT TEST SPLIT...")
+        print("=" * 80)
+        test_metrics = best_model.val(
+            data=config["dataset_yaml"],
+            split="test",
+            imgsz=imgsz,
+            batch=batch_size,
+            verbose=True,
+            workers=0,
+        )
+        eval_summary.update({
+            "test_precision": round(float(test_metrics.results_dict.get("metrics/precision(B)", 0.0)), 4),
+            "test_recall": round(float(test_metrics.results_dict.get("metrics/recall(B)", 0.0)), 4),
+            "test_mAP50": round(float(test_metrics.results_dict.get("metrics/mAP50(B)", 0.0)), 4),
+            "test_mAP50_95": round(float(test_metrics.results_dict.get("metrics/mAP50-95(B)", 0.0)), 4),
+        })
+
+    eval_json_path = os.path.join(PROJECT_ROOT, "results", "training", f"{name}_val_report.json")
     with open(eval_json_path, "w") as f:
         json.dump(eval_summary, f, indent=2)
-    print(f"\n[OK] Evaluation report saved to: {eval_json_path}")
+    print(f"\n[OK] Validation report saved to: {eval_json_path}")
 
     return {"status": "TRAINING_COMPLETED", "config": config, "metrics": eval_summary}
 
@@ -313,14 +369,18 @@ def train_cargo_yolo_exp_v3(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Cargo Vision YOLOv8 Exp v3 Training Pipeline")
     parser.add_argument("--dry-run", action="store_true", help="Validate dataset safety and configuration without training")
+    parser.add_argument("--resume", action="store_true", help="Resume training from last.pt checkpoint")
     parser.add_argument("--epochs", type=int, default=60, help="Target training epochs (default: 60)")
     parser.add_argument("--imgsz", type=int, default=800, help="Image resolution in pixels (default: 800)")
     parser.add_argument("--batch", type=int, default=16, help="Batch size (default: 16)")
+    parser.add_argument("--eval-test", action="store_true", help="Evaluate on held-out test split post-training")
     args = parser.parse_args()
 
     train_cargo_yolo_exp_v3(
         epochs=args.epochs,
         imgsz=args.imgsz,
         batch_size=args.batch,
+        resume=args.resume,
+        eval_test=args.eval_test,
         dry_run=args.dry_run,
     )
