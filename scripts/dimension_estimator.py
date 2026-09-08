@@ -1,10 +1,11 @@
 """
 dimension_estimator.py - Core Physical Dimension Estimation Engine
 ===================================================================
-Project: Cargo Vision Logistics System (Phase 2)
-Purpose: Provides two distinct, decoupled modes for physical dimension determination:
+Project: Cargo Vision Logistics System (BUG #6 Upgrade V1)
+Purpose: Provides an explicit, multi-tier physical dimension estimation engine:
          1. MODE 1 - Reference-Marker Measurement (High-precision fiducial scale detection via OpenCV).
-         2. MODE 2 - Category Prior Fallback (Configurable industry-standard parametric dimension envelopes).
+         2. MODE 1b - Reference Scale + 3D Aspect-Ratio Depth Inference (ARUCO_PLUS_ASPECT_PRIOR).
+         3. MODE 2 - Category Prior Fallback (Configurable industry-standard parametric dimension envelopes).
 
 Physical & Geometric Reality Notice:
 -------------------------------------
@@ -19,10 +20,10 @@ Physical & Geometric Reality Notice:
    depth plane Z as the reference marker. If the object extends significantly in depth (perspective foreshortening)
    or the camera view is oblique, 2D bounding boxes represent projected 2D extents rather than true 3D bounding boxes.
    Furthermore, a single frontal 2D view cannot directly measure the 3rd orthogonal depth dimension without
-   multi-view geometry or calibrated depth sensors.
+   multi-view geometry, calibrated depth sensors, or category aspect-ratio inference.
 
 3. Accuracy Disclaimer:
-   This module implements the geometric and calibration algorithms for dimension estimation.
+   This module implements geometric and calibration algorithms for dimension estimation.
    It does NOT claim 95% production accuracy until validated against a physically measured ground-truth benchmark.
 """
 
@@ -49,13 +50,23 @@ class EstimationStatus(str, Enum):
 class MeasurementSource(str, Enum):
     ARUCO_REFERENCE = "aruco_reference"
     CATEGORY_PRIOR = "category_prior"
+    ARUCO_PLUS_ASPECT_PRIOR = "aruco_plus_aspect_prior"
     NONE = "none"
+
+
+class EstimationMethod(str, Enum):
+    ARUCO_REFERENCE = "ARUCO_REFERENCE"
+    CATEGORY_PRIOR = "CATEGORY_PRIOR"
+    ARUCO_PLUS_ASPECT_PRIOR = "ARUCO_PLUS_ASPECT_PRIOR"
+    NONE = "NONE"
 
 
 @dataclass
 class DimensionEstimateResult:
     """
     Standardized, strongly-typed result schema for physical dimension estimation.
+    Maintains 100% backward compatibility with existing callers and adds explicit
+    estimation metadata, uncertainty bounds, and depth method tracking.
     """
     status: str
     source: Optional[str]
@@ -65,6 +76,12 @@ class DimensionEstimateResult:
     weight_kg: Optional[float] = None
     reference: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+    estimation_method: Optional[str] = None
+    uncertainty_cm: Dict[str, Optional[float]] = field(default_factory=dict)
+    uncertainty_percent: Dict[str, Optional[float]] = field(default_factory=dict)
+    measurement_confidence: Optional[float] = None
+    depth_estimation_method: Optional[str] = None
+    weight_source: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the result to a standard dictionary."""
@@ -189,8 +206,10 @@ class CategoryPriorEstimator:
             return DimensionEstimateResult(
                 status=EstimationStatus.ERROR.value,
                 source=None,
+                estimation_method=EstimationMethod.NONE.value,
                 dimensions_cm={"length": None, "width": None, "height": None},
                 confidence=0.0,
+                measurement_confidence=0.0,
                 scale_cm_per_pixel=None,
                 reference={"type": None, "size_cm": None, "detected": False},
                 warnings=[f"Unknown category '{category}'. No prior dimensions configured."],
@@ -209,17 +228,31 @@ class CategoryPriorEstimator:
             "User verification or physical tape measurement is recommended before fleet dispatch.",
         ]
 
+        # Deterministic population variability uncertainty (+/- 25% for unconstrained category envelope)
+        uncertainty_percent = {"length": 25.0, "width": 25.0, "height": 25.0}
+        uncertainty_cm = {
+            "length": round(length * 0.25, 1),
+            "width": round(width * 0.25, 1),
+            "height": round(height * 0.25, 1),
+        }
+
         return DimensionEstimateResult(
             status=EstimationStatus.PRIOR_ESTIMATE.value,
             source=MeasurementSource.CATEGORY_PRIOR.value,
+            estimation_method=EstimationMethod.CATEGORY_PRIOR.value,
             dimensions_cm={
                 "length": round(length, 1),
                 "width": round(width, 1),
                 "height": round(height, 1),
             },
             confidence=conf,
+            measurement_confidence=conf,
             scale_cm_per_pixel=None,
             weight_kg=round(weight, 2) if weight is not None else None,
+            weight_source="category_prior" if weight is not None else None,
+            depth_estimation_method="category_prior_default",
+            uncertainty_percent=uncertainty_percent,
+            uncertainty_cm=uncertainty_cm,
             reference={"type": "category_prior", "size_cm": None, "detected": False},
             warnings=warnings,
         )
@@ -233,6 +266,7 @@ class ReferenceMarkerEstimator:
     """
     Mode 1: Measures physical dimensions using a detected ArUco fiducial marker of known size.
     Calculates precise metric scale (cm/pixel) on the reference plane.
+    Supports conservative 3D aspect-ratio depth inference (Mode 1b) when category prior is available.
     """
 
     def __init__(self, aruco_dict_type: int = cv2.aruco.DICT_4X4_50):
@@ -332,12 +366,98 @@ class ReferenceMarkerEstimator:
 
         return float(scale_cm_per_pixel), warnings
 
+    def infer_aspect_depth(
+        self,
+        category: str,
+        measured_long_cm: float,
+        measured_short_cm: float,
+        priors: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Tuple[Optional[float], Optional[str], List[str]]:
+        """
+        Infers the missing orthogonal depth dimension using category prior aspect-ratio proportions.
+
+        Mathematical Rationale:
+          A single 2D frontal view measures 2 orthogonal dimensions on the planar reference plane.
+          By matching the observed 2D aspect ratio (measured_long / measured_short) to the canonical
+          3D proportions (length, width, height) of the category, we derive a conservative estimate
+          for the unobserved depth axis without claiming full 3D sensor reconstruction.
+        """
+        if priors is None:
+            priors = DEFAULT_CATEGORY_PRIORS
+
+        cat_key = category.strip().lower()
+        if cat_key not in priors:
+            return None, None, [f"Cannot infer depth: Category '{category}' has no configured prior envelope."]
+
+        prior = priors[cat_key]
+        p_l = float(prior["length_cm"])
+        p_w = float(prior["width_cm"])
+        p_h = float(prior["height_cm"])
+
+        if p_l <= 0 or p_w <= 0 or p_h <= 0 or measured_short_cm <= 0 or measured_long_cm <= 0:
+            return None, None, ["Invalid dimensions for aspect ratio depth inference."]
+
+        # 3 potential planar view pairings from canonical (L, W, H):
+        # 1. Front/Back view: Length x Height (missing: Width)
+        # 2. Top/Bottom view: Length x Width (missing: Height)
+        # 3. Side view: Width x Height (missing: Length)
+        view_configs = [
+            {
+                "name": "front_view",
+                "dim1": max(p_l, p_h),
+                "dim2": min(p_l, p_h),
+                "missing_dim_val": p_w,
+                "missing_name": "width",
+            },
+            {
+                "name": "top_view",
+                "dim1": max(p_l, p_w),
+                "dim2": min(p_l, p_w),
+                "missing_dim_val": p_h,
+                "missing_name": "height",
+            },
+            {
+                "name": "side_view",
+                "dim1": max(p_w, p_h),
+                "dim2": min(p_w, p_h),
+                "missing_dim_val": p_l,
+                "missing_name": "length",
+            },
+        ]
+
+        obs_ratio = measured_long_cm / measured_short_cm
+
+        # Find best matching view orientation by comparing aspect ratios
+        best_config = None
+        min_discrepancy = float("inf")
+        for cfg in view_configs:
+            cfg_ratio = cfg["dim1"] / cfg["dim2"]
+            discrepancy = abs(np.log(obs_ratio) - np.log(cfg_ratio))
+            if discrepancy < min_discrepancy:
+                min_discrepancy = discrepancy
+                best_config = cfg
+
+        if best_config is None:
+            return None, None, ["Failed to match aspect ratio."]
+
+        # Scale factor from measured dimensions to prior canonical size
+        scale_factor = 0.5 * ((measured_long_cm / best_config["dim1"]) + (measured_short_cm / best_config["dim2"]))
+        inferred_depth = round(scale_factor * best_config["missing_dim_val"], 1)
+
+        warnings = [
+            f"Orthogonal depth ({inferred_depth} cm) inferred from canonical 3D aspect ratio of '{cat_key}' ({best_config['name']}).",
+            "Depth is NOT directly measured by the sensor; actual physical depth may vary.",
+        ]
+
+        return inferred_depth, "category_aspect_ratio_prior", warnings
+
     def measure_dimensions(
         self,
         image_input: Union[str, np.ndarray, Image.Image],
         known_marker_size_cm: float,
         object_bbox_px: Tuple[int, int, int, int],
         category: Optional[str] = None,
+        infer_aspect_depth: bool = False,
     ) -> DimensionEstimateResult:
         """
         Executes reference-marker measurement on the target object bounding box.
@@ -347,13 +467,16 @@ class ReferenceMarkerEstimator:
             known_marker_size_cm: Known side length of square marker (cm).
             object_bbox_px: (xmin, ymin, xmax, ymax) of the detected object in pixels.
             category: Optional object class name for depth ratio priors.
+            infer_aspect_depth: When True and category is known, infers the missing orthogonal depth axis.
         """
         if known_marker_size_cm <= 0:
             return DimensionEstimateResult(
                 status=EstimationStatus.ERROR.value,
                 source=None,
+                estimation_method=EstimationMethod.NONE.value,
                 dimensions_cm={"length": None, "width": None, "height": None},
                 confidence=0.0,
+                measurement_confidence=0.0,
                 scale_cm_per_pixel=None,
                 reference={"type": "aruco", "size_cm": known_marker_size_cm, "detected": False},
                 warnings=[f"Invalid marker physical size: {known_marker_size_cm} cm. Must be positive."],
@@ -367,8 +490,10 @@ class ReferenceMarkerEstimator:
             return DimensionEstimateResult(
                 status=EstimationStatus.ERROR.value,
                 source=None,
+                estimation_method=EstimationMethod.NONE.value,
                 dimensions_cm={"length": None, "width": None, "height": None},
                 confidence=0.0,
+                measurement_confidence=0.0,
                 scale_cm_per_pixel=None,
                 reference={"type": "aruco", "size_cm": known_marker_size_cm, "detected": False},
                 warnings=["Invalid object bounding box: width and height must be positive."],
@@ -380,8 +505,10 @@ class ReferenceMarkerEstimator:
             return DimensionEstimateResult(
                 status=EstimationStatus.ERROR.value,
                 source=None,
+                estimation_method=EstimationMethod.NONE.value,
                 dimensions_cm={"length": None, "width": None, "height": None},
                 confidence=0.0,
+                measurement_confidence=0.0,
                 scale_cm_per_pixel=None,
                 reference={"type": "aruco", "size_cm": known_marker_size_cm, "detected": False},
                 warnings=[f"Failed to process image for marker detection: {str(e)}"],
@@ -391,8 +518,10 @@ class ReferenceMarkerEstimator:
             return DimensionEstimateResult(
                 status=EstimationStatus.REFERENCE_REQUIRED.value,
                 source=None,
+                estimation_method=EstimationMethod.NONE.value,
                 dimensions_cm={"length": None, "width": None, "height": None},
                 confidence=0.0,
+                measurement_confidence=0.0,
                 scale_cm_per_pixel=None,
                 reference={"type": "aruco", "size_cm": known_marker_size_cm, "detected": False},
                 warnings=[
@@ -410,26 +539,73 @@ class ReferenceMarkerEstimator:
 
         length_cm = max(measured_dim_x, measured_dim_y)
         height_cm = min(measured_dim_x, measured_dim_y)
-        width_cm = None  # 3rd orthogonal depth axis cannot be directly measured from single 2D frontal plane
+        width_cm = None
 
         warnings = list(scale_warnings)
         warnings.append(
             "Measured dimensions are planar 2D projections calibrated via the reference marker plane."
         )
-        warnings.append(
-            "Orthogonal depth (width) is unmeasured from a single monocular view."
-        )
+
+        depth_method = None
+        estimation_method = EstimationMethod.ARUCO_REFERENCE.value
+        source = MeasurementSource.ARUCO_REFERENCE.value
+        conf = 0.90
+
+        # Deterministic optical planar uncertainty (+/- 3.0% on calibrated reference plane)
+        uncertainty_percent = {"length": 3.0, "width": None, "height": 3.0}
+        uncertainty_cm = {
+            "length": round(length_cm * 0.03, 1),
+            "width": None,
+            "height": round(height_cm * 0.03, 1),
+        }
+
+        # Attempt Aspect-Ratio Depth Inference if requested and category is available
+        if infer_aspect_depth and category is not None:
+            depth_val, d_method, d_warnings = self.infer_aspect_depth(
+                category=category,
+                measured_long_cm=length_cm,
+                measured_short_cm=height_cm,
+            )
+            if depth_val is not None:
+                width_cm = depth_val
+                depth_method = d_method
+                estimation_method = EstimationMethod.ARUCO_PLUS_ASPECT_PRIOR.value
+                source = MeasurementSource.ARUCO_PLUS_ASPECT_PRIOR.value
+                conf = 0.85
+                uncertainty_percent["width"] = 20.0
+                uncertainty_cm["width"] = round(width_cm * 0.20, 1)
+                warnings.extend(d_warnings)
+            else:
+                warnings.extend(d_warnings)
+                warnings.append("Orthogonal depth (width) remains unmeasured from a single monocular view.")
+        else:
+            warnings.append("Orthogonal depth (width) is unmeasured from a single monocular view.")
+
+        # Default category weight if category known
+        weight_val = None
+        weight_src = None
+        if category is not None and category.strip().lower() in DEFAULT_CATEGORY_PRIORS:
+            prior_entry = DEFAULT_CATEGORY_PRIORS[category.strip().lower()]
+            weight_val = prior_entry.get("default_weight_kg")
+            weight_src = "category_prior"
 
         return DimensionEstimateResult(
             status=EstimationStatus.MEASURED.value,
-            source=MeasurementSource.ARUCO_REFERENCE.value,
+            source=source,
+            estimation_method=estimation_method,
             dimensions_cm={
                 "length": round(length_cm, 1),
-                "width": width_cm,
+                "width": round(width_cm, 1) if width_cm is not None else None,
                 "height": round(height_cm, 1),
             },
-            confidence=0.90,
+            confidence=conf,
+            measurement_confidence=conf,
             scale_cm_per_pixel=round(scale_cm_per_px, 6),
+            weight_kg=round(weight_val, 2) if weight_val is not None else None,
+            weight_source=weight_src,
+            depth_estimation_method=depth_method,
+            uncertainty_percent=uncertainty_percent,
+            uncertainty_cm=uncertainty_cm,
             reference={
                 "type": "aruco_dict_4x4_50",
                 "marker_id": marker_id,
@@ -448,7 +624,8 @@ class ReferenceMarkerEstimator:
 class DimensionEstimator:
     """
     Unified Hybrid Dimension Estimation Engine.
-    Orchestrates Reference-Marker Measurement (Mode 1) and Category-Prior Fallback (Mode 2).
+    Orchestrates Reference-Marker Measurement (Mode 1), Aspect-Ratio Depth Inference (Mode 1b),
+    and Category-Prior Fallback (Mode 2).
     """
 
     def __init__(
@@ -466,6 +643,7 @@ class DimensionEstimator:
         known_marker_size_cm: Optional[float] = None,
         object_bbox_px: Optional[Tuple[int, int, int, int]] = None,
         fallback_to_prior: bool = True,
+        infer_aspect_depth: bool = False,
     ) -> DimensionEstimateResult:
         """
         Main entry point for physical dimension estimation.
@@ -482,6 +660,7 @@ class DimensionEstimator:
                 known_marker_size_cm=known_marker_size_cm,
                 object_bbox_px=object_bbox_px,
                 category=category,
+                infer_aspect_depth=infer_aspect_depth,
             )
             if res.status == EstimationStatus.MEASURED.value:
                 return res
@@ -503,8 +682,10 @@ class DimensionEstimator:
         return DimensionEstimateResult(
             status=EstimationStatus.ERROR.value,
             source=None,
+            estimation_method=EstimationMethod.NONE.value,
             dimensions_cm={"length": None, "width": None, "height": None},
             confidence=0.0,
+            measurement_confidence=0.0,
             scale_cm_per_pixel=None,
             reference={"type": None, "size_cm": None, "detected": False},
             warnings=["Insufficient input parameters: provide either (image, marker_size, bbox) or a valid category."],

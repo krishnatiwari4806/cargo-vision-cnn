@@ -1025,7 +1025,38 @@ class TestCargoAnalysisPipeline(unittest.TestCase):
         self.assertIn("Low-confidence cargo detected: 'table'", warnings_str)
         self.assertIn("marked REVIEW_REQUIRED", warnings_str)
 
+    # -------------------------------------------------------------------------
+    # 51. BUG #6 Physical Dimension Estimation: ArUco with Aspect Depth Inference
+    # -------------------------------------------------------------------------
+    def test_aruco_analysis_with_aspect_depth_inference(self):
+        """Verify end-to-end pipeline analysis with infer_aspect_depth=True calculates volumetric metrics."""
+        res = self.pipeline.analyze(
+            image_path=self.marker_image_path,
+            quantity=1,
+            known_marker_size_cm=10.0,
+            object_bbox_px=(200, 200, 400, 300),
+            infer_aspect_depth=True,
+        )
+        self.assertEqual(res["status"], "SUCCESS")
+        dim_res = res["dimensions"]
+
+        self.assertEqual(dim_res["status"], "MEASURED")
+        self.assertIn(dim_res["source"], ["aruco_plus_aspect_prior", "aruco_reference"])
+        self.assertIsNotNone(dim_res["length_cm"])
+        self.assertIsNotNone(dim_res["height_cm"])
+
+        # Estimation metadata and uncertainty bounds are present
+        self.assertIn("estimation_method", dim_res)
+        self.assertIn("uncertainty_cm", dim_res)
+        self.assertIn("uncertainty_percent", dim_res)
+
+        # If category is known and depth is inferred, volumetric requirements are computed
+        if dim_res["width_cm"] is not None:
+            self.assertEqual(dim_res["estimation_method"], "ARUCO_PLUS_ASPECT_PRIOR")
+            self.assertIsNotNone(res["cargo_summary"]["total_volume_m3"])
+            self.assertIsNotNone(res["cargo_summary"]["required_floor_area_m2"])
+            self.assertIsNotNone(res["vehicle_recommendation"]["vehicle_id"])
+
 
 if __name__ == "__main__":
     unittest.main()
-

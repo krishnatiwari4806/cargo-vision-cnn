@@ -818,6 +818,7 @@ class CargoAnalysisPipeline:
         known_marker_size_cm: Optional[float] = None,
         object_bbox_px: Optional[Tuple[int, int, int, int]] = None,
         extract_all_objects: bool = False,
+        infer_aspect_depth: bool = False,
     ) -> Dict[str, Any]:
         """
         Executes end-to-end analysis on a single cargo photo.
@@ -829,6 +830,8 @@ class CargoAnalysisPipeline:
             object_bbox_px: Optional bounding box override.
             extract_all_objects: When True, extracts ALL valid detected cargo objects in the image
                                 and aggregates their physical requirements into a combined shipment.
+            infer_aspect_depth: When True and marker is used, infers missing orthogonal depth axis
+                                from category 3D aspect-ratio prior.
         """
         all_warnings = ["95% target has not yet been validated against a measured physical benchmark."]
 
@@ -885,16 +888,26 @@ class CargoAnalysisPipeline:
             review_required_items = []
             for cat, count in category_counts.items():
                 qty = count * (quantity if quantity > 1 else 1)
-                dim_res = self.dimension_estimator.estimate(category=cat, fallback_to_prior=True)
+                dim_res = self.dimension_estimator.estimate(
+                    category=cat,
+                    fallback_to_prior=True,
+                    infer_aspect_depth=infer_aspect_depth,
+                )
                 all_warnings.extend(dim_res.warnings)
 
                 dims_dict = {
                     "status": dim_res.status,
                     "source": dim_res.source,
+                    "estimation_method": getattr(dim_res, "estimation_method", dim_res.source),
                     "length_cm": dim_res.dimensions_cm.get("length"),
                     "width_cm": dim_res.dimensions_cm.get("width"),
                     "height_cm": dim_res.dimensions_cm.get("height"),
+                    "uncertainty_cm": getattr(dim_res, "uncertainty_cm", {}),
+                    "uncertainty_percent": getattr(dim_res, "uncertainty_percent", {}),
+                    "measurement_confidence": getattr(dim_res, "measurement_confidence", dim_res.confidence),
+                    "depth_estimation_method": getattr(dim_res, "depth_estimation_method", None),
                     "weight_kg": getattr(dim_res, "weight_kg", None),
+                    "weight_source": getattr(dim_res, "weight_source", None),
                     "confidence": dim_res.confidence,
                 }
 
@@ -1030,16 +1043,23 @@ class CargoAnalysisPipeline:
             known_marker_size_cm=known_marker_size_cm,
             object_bbox_px=effective_bbox,
             fallback_to_prior=True,
+            infer_aspect_depth=infer_aspect_depth,
         )
         all_warnings.extend(dim_res.warnings)
 
         dimensions_dict = {
             "status": dim_res.status,
             "source": dim_res.source,
+            "estimation_method": getattr(dim_res, "estimation_method", dim_res.source),
             "length_cm": dim_res.dimensions_cm.get("length"),
             "width_cm": dim_res.dimensions_cm.get("width"),
             "height_cm": dim_res.dimensions_cm.get("height"),
+            "uncertainty_cm": getattr(dim_res, "uncertainty_cm", {}),
+            "uncertainty_percent": getattr(dim_res, "uncertainty_percent", {}),
+            "measurement_confidence": getattr(dim_res, "measurement_confidence", dim_res.confidence),
+            "depth_estimation_method": getattr(dim_res, "depth_estimation_method", None),
             "weight_kg": getattr(dim_res, "weight_kg", None),
+            "weight_source": getattr(dim_res, "weight_source", None),
             "confidence": dim_res.confidence,
         }
 
@@ -1091,6 +1111,7 @@ class CargoAnalysisPipeline:
         self,
         image_paths: List[str],
         quantities: Optional[List[int]] = None,
+        infer_aspect_depth: bool = False,
     ) -> Dict[str, Any]:
         """
         Executes end-to-end multi-load analysis on multiple cargo photos.
@@ -1116,7 +1137,7 @@ class CargoAnalysisPipeline:
         all_warnings = ["95% target has not yet been validated against a measured physical benchmark."]
 
         for idx, (img_path, qty) in enumerate(zip(image_paths, quantities)):
-            single_res = self.analyze(image_path=img_path, quantity=qty)
+            single_res = self.analyze(image_path=img_path, quantity=qty, infer_aspect_depth=infer_aspect_depth)
             if single_res.get("status") == "ERROR":
                 return {
                     "status": "ERROR",
@@ -1214,6 +1235,8 @@ def main():
     parser.add_argument("--marker-size", type=float, default=None, help="Optional known physical marker size in cm.")
     parser.add_argument("--bbox", type=int, nargs=4, default=None, metavar=("XMIN", "YMIN", "XMAX", "YMAX"),
                         help="Optional object bounding box in pixels (xmin ymin xmax ymax).")
+    parser.add_argument("--infer-aspect-depth", action="store_true",
+                        help="Infer missing orthogonal depth axis from category 3D aspect-ratio prior when metric scale is measured.")
     parser.add_argument("--json", action="store_true", help="Output raw JSON instead of formatted text.")
     args = parser.parse_args()
 
@@ -1227,6 +1250,7 @@ def main():
         result = pipeline.analyze_multiple(
             image_paths=args.images,
             quantities=args.quantities,
+            infer_aspect_depth=args.infer_aspect_depth,
         )
 
         if args.json:

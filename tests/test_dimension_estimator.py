@@ -225,6 +225,113 @@ class TestDimensionEstimator(unittest.TestCase):
         )
         self.assertEqual(res_inv.status, EstimationStatus.ERROR.value)
 
+    # -------------------------------------------------------------------------
+    # 11. Category Prior Metadata & Uncertainty Bounds (BUG #6)
+    # -------------------------------------------------------------------------
+    def test_category_prior_metadata_and_uncertainty(self):
+        """Verify Category Prior returns explicit metadata, estimation method, and uncertainty bounds."""
+        res = self.prior_estimator.estimate("box")
+        self.assertEqual(res.status, EstimationStatus.PRIOR_ESTIMATE.value)
+        self.assertEqual(res.source, MeasurementSource.CATEGORY_PRIOR.value)
+        self.assertEqual(res.estimation_method, "CATEGORY_PRIOR")
+        self.assertEqual(res.depth_estimation_method, "category_prior_default")
+        self.assertEqual(res.weight_source, "category_prior")
+
+        # Check uncertainty bounds
+        self.assertIn("length", res.uncertainty_cm)
+        self.assertIn("width", res.uncertainty_cm)
+        self.assertIn("height", res.uncertainty_cm)
+        self.assertGreater(res.uncertainty_cm["length"], 0.0)
+        self.assertEqual(res.uncertainty_percent["length"], 25.0)
+
+    # -------------------------------------------------------------------------
+    # 12. ArUco with 3D Aspect-Ratio Depth Inference (BUG #6)
+    # -------------------------------------------------------------------------
+    def test_aruco_with_aspect_ratio_depth_inference(self):
+        """Verify ArUco mode with infer_aspect_depth=True derives missing depth from category proportions."""
+        # Simulated box bbox: 400px wide, 200px high
+        obj_bbox = (200, 200, 600, 400)
+
+        result = self.ref_estimator.measure_dimensions(
+            image_input=self.canvas_with_marker,
+            known_marker_size_cm=self.marker_size_cm,
+            object_bbox_px=obj_bbox,
+            category="box",
+            infer_aspect_depth=True,
+        )
+
+        self.assertEqual(result.status, EstimationStatus.MEASURED.value)
+        self.assertEqual(result.source, MeasurementSource.ARUCO_PLUS_ASPECT_PRIOR.value)
+        self.assertEqual(result.estimation_method, "ARUCO_PLUS_ASPECT_PRIOR")
+        self.assertEqual(result.depth_estimation_method, "category_aspect_ratio_prior")
+
+        # Planar dimensions measured
+        self.assertAlmostEqual(result.dimensions_cm["length"], 40.0, delta=1.0)
+        self.assertAlmostEqual(result.dimensions_cm["height"], 20.0, delta=1.0)
+
+        # Depth inferred and non-None
+        self.assertIsNotNone(result.dimensions_cm["width"])
+        self.assertGreater(result.dimensions_cm["width"], 0.0)
+
+        # Uncertainty: planar is 3%, inferred depth is 20%
+        self.assertEqual(result.uncertainty_percent["length"], 3.0)
+        self.assertEqual(result.uncertainty_percent["height"], 3.0)
+        self.assertEqual(result.uncertainty_percent["width"], 20.0)
+        self.assertGreater(result.uncertainty_cm["width"], 0.0)
+
+    # -------------------------------------------------------------------------
+    # 13. ArUco with Unknown Category Avoids Fabricated Depth (BUG #6)
+    # -------------------------------------------------------------------------
+    def test_aruco_unknown_category_safely_avoids_fabricated_depth(self):
+        """Verify ArUco measurement with unknown category does not invent depth values."""
+        obj_bbox = (200, 200, 600, 400)
+        result = self.ref_estimator.measure_dimensions(
+            image_input=self.canvas_with_marker,
+            known_marker_size_cm=self.marker_size_cm,
+            object_bbox_px=obj_bbox,
+            category="unknown_alien_satellite",
+            infer_aspect_depth=True,
+        )
+
+        self.assertEqual(result.status, EstimationStatus.MEASURED.value)
+        self.assertEqual(result.source, MeasurementSource.ARUCO_REFERENCE.value)
+        self.assertEqual(result.estimation_method, "ARUCO_REFERENCE")
+        self.assertIsNone(result.dimensions_cm["width"])
+        self.assertIsNone(result.uncertainty_cm["width"])
+
+    # -------------------------------------------------------------------------
+    # 14. Direct Aspect-Ratio Depth Inference Math (BUG #6)
+    # -------------------------------------------------------------------------
+    def test_direct_aspect_ratio_depth_inference_math(self):
+        """Verify infer_aspect_depth proportional scaling across multiple canonical categories."""
+        categories_to_test = ["box", "couch", "table", "refrigerator", "chair"]
+        for cat in categories_to_test:
+            depth_val, method, warnings = self.ref_estimator.infer_aspect_depth(
+                category=cat,
+                measured_long_cm=100.0,
+                measured_short_cm=50.0,
+            )
+            self.assertIsNotNone(depth_val, f"Failed depth inference for category: {cat}")
+            self.assertGreater(depth_val, 0.0)
+            self.assertEqual(method, "category_aspect_ratio_prior")
+
+    # -------------------------------------------------------------------------
+    # 15. Unified Estimator Aspect Depth Propagation (BUG #6)
+    # -------------------------------------------------------------------------
+    def test_unified_estimator_aspect_depth_propagation(self):
+        """Verify unified DimensionEstimator correctly propagates infer_aspect_depth."""
+        res = self.unified_estimator.estimate(
+            image_input=self.canvas_with_marker,
+            known_marker_size_cm=10.0,
+            object_bbox_px=(200, 200, 600, 400),
+            category="chair",
+            infer_aspect_depth=True,
+        )
+        self.assertEqual(res.status, EstimationStatus.MEASURED.value)
+        self.assertEqual(res.estimation_method, "ARUCO_PLUS_ASPECT_PRIOR")
+        self.assertIsNotNone(res.dimensions_cm["width"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
