@@ -892,6 +892,7 @@ class CargoAnalysisPipeline:
         user_weight_kg: Optional[float] = None,
         measured_scale_weight_kg: Optional[float] = None,
         user_weights_kg: Optional[List[Optional[float]]] = None,
+        category_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes end-to-end analysis on a single cargo photo.
@@ -908,6 +909,7 @@ class CargoAnalysisPipeline:
             user_weight_kg: Optional user/manifest declared unit weight in kg.
             measured_scale_weight_kg: Optional certified external scale weight in kg.
             user_weights_kg: Optional list of user weights corresponding to extracted object instances.
+            category_override: Optional user-declared cargo category (overrides detection for physical specs).
         """
         all_warnings = ["95% target has not yet been validated against a measured physical benchmark."]
 
@@ -1102,7 +1104,7 @@ class CargoAnalysisPipeline:
 
         # Fallback to MobileNetV2 if YOLO did not detect any object or backend is mobilenetv2
         if classification_res is None:
-            if self.detector_backend == "yolo":
+            if self.detector_backend == "yolo" and category_override is None:
                 all_warnings.extend(yolo_warnings)
                 return {
                     "status": "ERROR",
@@ -1110,23 +1112,38 @@ class CargoAnalysisPipeline:
                     "input_image": image_path,
                     "warnings": all_warnings,
                 }
-            try:
-                classification_res, cls_warnings = self.classify_image(img_rgb)
-                all_warnings.extend(cls_warnings)
-                detected_category = classification_res["class_name"]
-            except Exception as e:
-                return {
-                    "status": "ERROR",
-                    "error": f"Classification model execution failed: {str(e)}",
-                    "input_image": image_path,
-                    "warnings": all_warnings,
-                }
+            elif self.detector_backend != "yolo":
+                try:
+                    classification_res, cls_warnings = self.classify_image(img_rgb)
+                    all_warnings.extend(cls_warnings)
+                    detected_category = classification_res["class_name"]
+                except Exception as e:
+                    if category_override is None:
+                        return {
+                            "status": "ERROR",
+                            "error": f"Classification model execution failed: {str(e)}",
+                            "input_image": image_path,
+                            "warnings": all_warnings,
+                        }
+
+        # Determine effective cargo category for physical requirements & vehicle recommendation
+        effective_category = category_override.strip().lower() if category_override else detected_category
+        if effective_category is None:
+            effective_category = "box"
+
+        if classification_res is None:
+            classification_res = {
+                "class_name": effective_category,
+                "confidence": 1.0,
+                "backend": "user_declared",
+                "reliability": "USER_DECLARED",
+            }
 
         # 4. Dimension & Weight Estimation
         effective_bbox = object_bbox_px if object_bbox_px is not None else auto_bbox
         dim_res = self.dimension_estimator.estimate(
             image_input=image_path if known_marker_size_cm is not None and effective_bbox is not None else None,
-            category=detected_category,
+            category=effective_category,
             known_marker_size_cm=known_marker_size_cm,
             object_bbox_px=effective_bbox,
             fallback_to_prior=True,
@@ -1159,7 +1176,7 @@ class CargoAnalysisPipeline:
         # 5. Total Cargo Calculation
         cargo_summary, cargo_warnings = self.calculate_cargo_requirements(
             dimensions=dimensions_dict,
-            category=detected_category,
+            category=effective_category,
             quantity=quantity,
             unit_weight_kg=dimensions_dict.get("weight_kg"),
             user_weight_kg=user_weight_kg,
@@ -1169,7 +1186,7 @@ class CargoAnalysisPipeline:
 
         # 6. Vehicle Recommendation
         vehicle_rec, veh_warnings = self.recommend_vehicle(
-            category=detected_category,
+            category=effective_category,
             dimensions=dimensions_dict,
             cargo_summary=cargo_summary,
             quantity=quantity,
@@ -1200,6 +1217,8 @@ class CargoAnalysisPipeline:
             "cargo_summary": cargo_summary,
             "vehicle_recommendation": vehicle_rec,
             "warnings": deduped_warnings,
+            "user_declared_category": category_override.strip().lower() if category_override else None,
+            "effective_category": effective_category,
         }
 
     def analyze_multiple(

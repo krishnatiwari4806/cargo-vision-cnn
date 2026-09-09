@@ -142,7 +142,28 @@ python scripts/predict_cargo.py --image data/classification/test/couch/suggested
 python scripts/predict_cargo.py --image data/classification/test/chair/Chair_12_JPG.rf.6e9da998b38b475535da707cc6bef7f7_chair_0.jpg --model-type scratch
 ```
 
-### 5.6 Launch Interactive Jupyter Walkthrough
+### 5.6 Quick Manual Image Test (Interactive Runner)
+
+For simple manual testing of any cargo photo without specifying complex CLI arguments:
+
+1. **Place a test image** into `data/test_images/` (supports `.jpg`, `.png`, `.jpeg`, `.webp`, `.bmp`).
+2. **Run the interactive tester**:
+   ```powershell
+   .\.venv\Scripts\python.exe run.py
+   # or
+   test.bat
+   ```
+3. **Answer the simple guided prompts**:
+   - Cargo category (or `0` for AI Auto-Detection)
+   - Quantity (default: 1)
+   - Actual weight (optional user/manifest declaration)
+4. **View the complete logistics analysis report** with detection confidence, dimensions, volume, weight provenance, vehicle recommendation, and safety disclaimers.
+
+> [!NOTE]
+> - The `data/test_images/` folder is dedicated strictly to manual inference testing and is **NOT** part of model training/validation datasets.
+> - Normal 2D RGB photographs do not directly measure gravitational mass; weight calculated under `CATEGORY_PRIOR` represents an engineering estimate (±40% uncertainty).
+
+### 5.7 Launch Interactive Jupyter Walkthrough
 ```powershell
 jupyter notebook notebooks/cargo_vision_pipeline.ipynb
 ```
